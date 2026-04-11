@@ -56,8 +56,17 @@ def create_exchange(
     return exchange
 
 
-def fetch_ohlcv_frame(exchange, symbol: str, timeframe: str) -> pd.DataFrame:
-    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe)
+def fetch_ohlcv_frame(exchange, symbol: str, timeframe: str, limit: int | None = None) -> pd.DataFrame:
+    try:
+        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except TypeError:
+        try:
+            if limit is None:
+                bars = exchange.fetch_ohlcv(symbol, timeframe)
+            else:
+                bars = exchange.fetch_ohlcv(symbol, timeframe, limit)
+        except TypeError:
+            bars = exchange.fetch_ohlcv(symbol, timeframe)
 
     if not bars:
         raise ValueError(

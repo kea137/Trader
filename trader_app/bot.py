@@ -222,6 +222,14 @@ def summarize_order_book(order_book: dict, sell_pressure_ratio: float) -> tuple[
     return bid_volume, ask_volume, "NEUTRAL"
 
 
+def format_decision_summary(snapshot: MarketSnapshot, use_xgboost: bool) -> str:
+    ml_tag = f" ml_bias={snapshot.ml_bias}" if use_xgboost and snapshot.ml_bias is not None else ""
+    return (
+        f"signal={snapshot.signal} order_book={snapshot.order_book_bias}{ml_tag} "
+        f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f}"
+    )
+
+
 def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboost: bool) -> tuple[bool, str]:
     if snapshot.signal == "BUY":
         if snapshot.order_book_bias != "BUY":
@@ -251,6 +259,7 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
         exchange=exchange,
         symbol=settings.symbol,
         timeframe=settings.timeframe,
+        limit=settings.long_window + 50,
     )
     analyzed = add_moving_averages(
         frame=frame,
@@ -320,6 +329,7 @@ def should_exit_position(
 
 def liquidate_position(settings: Settings, exchange: Any, state: BotState, reason: str) -> CycleOutcome:
     snapshot = inspect_market(settings, exchange)
+    summary = format_decision_summary(snapshot, settings.use_xgboost)
     close_amount = state.entry_amount or settings.order_amount
     close_signal = "SELL" if (state.last_entry_signal or "BUY") == "BUY" else "BUY"
     exit_execution = execute_trade(
@@ -342,9 +352,7 @@ def liquidate_position(settings: Settings, exchange: Any, state: BotState, reaso
             entry_cost=None,
         )
     return CycleOutcome(
-        f"MANUAL | signal={snapshot.signal} order_book={snapshot.order_book_bias} "
-        f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f} "
-        f"decision={close_signal} reason={reason} | {exit_execution.message} | {profit_message}",
+        f"MANUAL | {summary} decision={close_signal} reason={reason} | {exit_execution.message} | {profit_message}",
         terminate=exit_execution.success,
     )
 
@@ -389,6 +397,7 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                 fallback_price=(snapshot.best_bid if exit_signal == "SELL" else snapshot.best_ask) or snapshot.latest_close,
             )
             profit_message = format_realized_profit(state, exit_execution)
+            summary = format_decision_summary(snapshot, settings.use_xgboost)
             if exit_execution.success:
                 update_state(
                     state,
@@ -400,24 +409,20 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                     entry_cost=None,
                 )
             return CycleOutcome(
-                f"HOLDING | signal={snapshot.signal} order_book={snapshot.order_book_bias} "
-                f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f} "
-                f"decision={exit_signal} reason={reason} | {exit_execution.message} | {profit_message}"
-                ,
+                f"HOLDING | {summary} decision={exit_signal} reason={reason} | {exit_execution.message} | {profit_message}",
                 terminate=False,
             )
+        summary = format_decision_summary(snapshot, settings.use_xgboost)
         return CycleOutcome(
-            f"HOLDING | signal={snapshot.signal} order_book={snapshot.order_book_bias} "
-            f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f} decision=HOLD"
+            f"HOLDING | {summary} decision=HOLD"
         )
 
     if snapshot.signal in {"BUY", "SELL"}:
+        summary = format_decision_summary(snapshot, settings.use_xgboost)
         enter, reason = should_enter_position(snapshot, settings.allow_short, settings.use_xgboost)
         if not enter:
             return CycleOutcome(
-                f"FLAT | signal={snapshot.signal} order_book={snapshot.order_book_bias} "
-                f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f} "
-                f"decision=WAIT reason={reason}"
+                f"FLAT | {summary} decision=WAIT reason={reason}"
             )
         entry_execution = execute_trade(
             exchange=exchange,
@@ -438,14 +443,12 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                 entry_cost=entry_execution.cost,
             )
         return CycleOutcome(
-            f"FLAT | signal={snapshot.signal} order_book={snapshot.order_book_bias} "
-            f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f} "
-            f"decision={snapshot.signal} | {entry_execution.message}"
+            f"FLAT | {summary} decision={snapshot.signal} | {entry_execution.message}"
         )
 
+    summary = format_decision_summary(snapshot, settings.use_xgboost)
     return CycleOutcome(
-        f"FLAT | signal={snapshot.signal} order_book={snapshot.order_book_bias} "
-        f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f} decision=WAIT"
+        f"FLAT | {summary} decision=WAIT"
     )
 
 

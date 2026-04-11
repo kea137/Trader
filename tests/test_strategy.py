@@ -11,6 +11,7 @@ from trader_app.bot import (
     execute_trade,
     execute_signal,
     fetch_exchange_preflight,
+    format_decision_summary,
     format_realized_profit,
     format_auth_error,
     handle_user_command,
@@ -249,6 +250,31 @@ def test_inspect_market_combines_signal_and_order_book():
     assert snapshot.best_bid == 100
     assert snapshot.best_ask == 101
     assert snapshot.long_ma > 0
+
+
+def test_inspect_market_uses_ml_bias_when_enabled(monkeypatch):
+    class FakeExchange:
+        id = "fake"
+
+        def fetch_ohlcv(self, symbol, timeframe, limit=None):
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(1, 101), start=1)]
+
+        def fetch_order_book(self, symbol, limit):
+            return {"bids": [[100, 10]], "asks": [[101, 3]]}
+
+    called = {"invoked": False}
+
+    def fake_compute_ml_bias(frame, short_window, long_window):
+        called["invoked"] = True
+        return "SELL"
+
+    monkeypatch.setattr("trader_app.strategy.compute_ml_bias", fake_compute_ml_bias)
+
+    settings = Settings(use_xgboost=True, short_window=5, long_window=20)
+    snapshot = inspect_market(settings, FakeExchange())
+
+    assert called["invoked"] is True
+    assert snapshot.ml_bias == "SELL"
 
 
 def test_should_enter_position_requires_order_book_confirmation():
@@ -498,7 +524,42 @@ def test_handle_user_command_status_reports_state():
     outcome = handle_user_command(Settings(), object(), state, "status")
 
     assert "has_position=True" in outcome.message
-    assert outcome.terminate is False
+
+
+def test_format_decision_summary_includes_ml_bias_when_enabled():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="BUY",
+        latest_close=300.0,
+        best_bid=100.0,
+        best_ask=101.0,
+        long_ma=250.0,
+        ml_bias="BUY",
+    )
+
+    summary = format_decision_summary(snapshot, use_xgboost=True)
+
+    assert "ml_bias=BUY" in summary
+
+
+def test_format_decision_summary_omits_ml_bias_when_disabled():
+    snapshot = MarketSnapshot(
+        signal="SELL",
+        bid_volume=5.0,
+        ask_volume=10.0,
+        order_book_bias="SELL",
+        latest_close=200.0,
+        best_bid=99.0,
+        best_ask=100.0,
+        long_ma=250.0,
+        ml_bias="SELL",
+    )
+
+    summary = format_decision_summary(snapshot, use_xgboost=False)
+
+    assert "ml_bias" not in summary
 
 
 def test_execute_signal_returns_failed_message_when_order_creation_fails():

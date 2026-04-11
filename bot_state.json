@@ -1,8 +1,8 @@
 {
-  "entry_amount": null,
+  "entry_amount": 0.1,
   "entry_cost": null,
-  "entry_price": null,
-  "entry_timestamp": null,
-  "has_position": false,
-  "last_entry_signal": null
+  "entry_price": 73427.3,
+  "entry_timestamp": 1775938831.9085498,
+  "has_position": true,
+  "last_entry_signal": "BUY"
 }
