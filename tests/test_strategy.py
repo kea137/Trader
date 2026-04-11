@@ -4,6 +4,8 @@ import pandas as pd
 
 from trader_app.bot import (
     BotState,
+    MarketSnapshot,
+    OrderExecution,
     describe_mode,
     describe_state_file,
     execute_trade,
@@ -19,6 +21,7 @@ from trader_app.bot import (
     run_cycle,
     run_bot,
     save_state,
+    should_enter_position,
     should_exit_position,
     summarize_order_book,
     update_state,
@@ -245,6 +248,88 @@ def test_inspect_market_combines_signal_and_order_book():
     assert snapshot.latest_close == 300.0
     assert snapshot.best_bid == 100
     assert snapshot.best_ask == 101
+    assert snapshot.long_ma > 0
+
+
+def test_should_enter_position_requires_order_book_confirmation():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=20,
+        order_book_bias="SELL",
+        latest_close=300.0,
+        best_bid=100.0,
+        best_ask=101.0,
+        long_ma=250.0,
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=False)
+
+    assert enter is False
+    assert reason == "order_book_conflict"
+
+
+def test_should_enter_short_position_requires_bearish_confirmation():
+    snapshot = MarketSnapshot(
+        signal="SELL",
+        bid_volume=10,
+        ask_volume=20,
+        order_book_bias="SELL",
+        latest_close=200.0,
+        best_bid=100.0,
+        best_ask=101.0,
+        long_ma=250.0,
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=True, use_xgboost=False)
+
+    assert enter is True
+    assert reason == "signal_and_order_book"
+
+
+def test_run_cycle_waits_when_buy_signal_lacks_order_book_confirmation():
+    class FakeExchange:
+        id = "fake"
+
+        def fetch_ohlcv(self, symbol, timeframe):
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(1, 301), start=1)]
+
+        def fetch_order_book(self, symbol, limit):
+            return {"bids": [[100, 1]], "asks": [[101, 4]]}
+
+    outcome = run_cycle(Settings(execute_orders=True, order_amount=0.5), FakeExchange(), BotState())
+
+    assert "decision=WAIT reason=order_book_conflict" in outcome.message
+    assert outcome.terminate is False
+
+
+def test_run_cycle_shorts_when_flat_and_signal_is_sell():
+    class FakeExchange:
+        id = "fake"
+
+        def __init__(self):
+            self.orders = []
+
+        def fetch_ohlcv(self, symbol, timeframe):
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(300, 0, -1), start=1)]
+
+        def fetch_order_book(self, symbol, limit):
+            return {"bids": [[100, 1]], "asks": [[101, 4]]}
+
+        def create_order(self, symbol, type, side, amount):
+            self.orders.append({"symbol": symbol, "type": type, "side": side, "amount": amount})
+            return {"id": "short123", "status": "closed", "filled": amount, "average": 100.0, "cost": 100.0}
+
+    state = BotState()
+    exchange = FakeExchange()
+
+    outcome = run_cycle(Settings(execute_orders=True, order_amount=0.5, allow_short=True), exchange, state)
+
+    assert "decision=SELL" in outcome.message
+    assert "EXECUTED SELL 0.5 BTC/USDT order_id=short123 status=closed" in outcome.message
+    assert state.has_position is True
+    assert state.last_entry_signal == "SELL"
+    assert exchange.orders[0]["side"] == "sell"
 
 
 def test_should_exit_position_sells_on_bearish_order_book():
@@ -561,6 +646,13 @@ def test_format_auth_error_mentions_environment_mismatch():
 
     assert "sandbox/testnet mode" in message
     assert "match the selected environment" in message
+
+
+def test_format_realized_profit_supports_short_positions():
+    state = BotState(last_entry_signal="SELL", entry_amount=1.0, entry_cost=100.0)
+    exit_execution = OrderExecution(success=True, message="", filled_amount=1.0, average_price=90.0, cost=90.0)
+
+    assert format_realized_profit(state, exit_execution) == "profit=10.000000 quote_currency profit_pct=10.00%"
 
 
 def test_format_auth_error_mentions_demo_environment():

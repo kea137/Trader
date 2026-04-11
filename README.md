@@ -85,8 +85,10 @@ python3 trader.py --exchange binance --symbol ETH/USDT --timeframe 4h --short-wi
 - `--sandbox` tells CCXT to switch to the exchange's testnet environment when supported.
 - `--demo` enables Bybit demo trading through `api-demo.bybit.com`.
 - Live execution uses market orders for the configured `--order-amount`.
-- The bot is now long-only in spot mode: it buys when flat on a `BUY` signal, then supervises the open trade.
-- A held trade is sold when either the moving-average signal flips to `SELL` or the top-of-book asks outweigh bids by the configured sell-pressure threshold.
+- The bot now requires both a `BUY` moving-average signal and buy-side order-book pressure before opening a new long position, making entries more conservative.
+- The bot can also open short positions when run with `--allow-short`. In that mode it shorts on a `SELL` signal only when order-book pressure also supports selling.
+- A held long position is sold when either the moving-average signal flips to `SELL` or the top-of-book asks outweigh bids by the configured sell-pressure threshold.
+- A held short position is covered when the signal flips to `BUY` or when buy-side order-book pressure dominates.
 - The bot persists its position state in `bot_state.json` by default, so a restart keeps supervising the previous trade state.
 - Use `--state-file` to isolate state per exchange, symbol, or environment.
 - Use `--max-hold 5m`, `--max-hold 30m`, or `--max-hold 3h` to force a sell once a position has been held that long.

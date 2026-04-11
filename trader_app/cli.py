@@ -51,6 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum time to hold a position before forcing a sell, for example 30m or 1h.",
     )
     parser.add_argument(
+        "--allow-short",
+        action="store_true",
+        help="Allow short entries when the signal and order-book bias indicate a bearish trend.",
+    )
+    parser.add_argument(
+        "--use-xgboost",
+        action="store_true",
+        help="Enable XGBoost-based model confirmation for entry signals.",
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="Place live market orders. Without this flag the bot runs in dry-run mode.",
@@ -83,6 +93,8 @@ def parse_settings() -> Settings:
         execute_orders=args.execute,
         sandbox=args.sandbox,
         demo=args.demo,
+        allow_short=args.allow_short,
+        use_xgboost=args.use_xgboost,
         poll_seconds=args.poll_seconds,
         order_book_depth=args.order_book_depth,
         sell_pressure_ratio=args.sell_pressure_ratio,

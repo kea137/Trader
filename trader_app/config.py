@@ -16,6 +16,8 @@ class Settings:
     execute_orders: bool = False
     sandbox: bool = False
     demo: bool = False
+    allow_short: bool = False
+    use_xgboost: bool = False
     poll_seconds: int = 0
     order_book_depth: int = 5
     sell_pressure_ratio: float = 1.2
