@@ -1,20 +1,39 @@
 # Trader
 
-Small Python trading bot that derives a moving-average signal from exchange
-OHLCV data, enters a long trade on a buy signal, and supervises that position
-until conditions justify an exit.
+A small Python trading bot that generates a moving-average signal from exchange OHLCV data and manages trades using order-book bias, stop-loss, take-profit, and optional shorting.
 
-## Structure
+## Overview
 
-- `trader.py`: runnable entry point
-- `trader_app/config.py`: default runtime settings
-- `trader_app/data.py`: exchange client creation and market-data loading
-- `trader_app/strategy.py`: moving-average calculations and signal generation
-- `trader_app/bot.py`: signal execution, order-book supervision, and bot loop
-- `trader_app/cli.py`: command-line argument handling and application wiring
-- `tests/test_strategy.py`: basic strategy behavior checks
+This bot is designed for demo and paper trading. It:
 
-## Usage
+- fetches OHLCV data from a CCXT-supported exchange
+- computes short and long moving averages
+- generates a `BUY` signal when the short moving average is above the long moving average
+- generates a `SELL` signal when the short moving average is below the long moving average
+- optionally enters short trades with `--allow-short`
+- supervises open positions until an exit condition is met
+
+The bot uses market orders and keeps a persistent state file so it can continue supervising a trade across restarts.
+
+## Features
+
+- dry-run mode by default
+- live execution with `--execute`
+- Bybit demo mode with `--demo`
+- optional short selling with `--allow-short`
+- stop-loss and take-profit thresholds
+- maximum hold timer
+- order-book confirmation for entry and exit decisions
+- optional XGBoost-based bias filtering with `--use-xgboost`
+- interactive terminal commands while the bot runs
+
+## Requirements
+
+- Python 3.10+
+- `ccxt`
+- `pandas`
+- `pytest` for tests
+- Optional: `xgboost` if you want ML-based signal confirmation
 
 Install dependencies:
 
@@ -22,29 +41,27 @@ Install dependencies:
 pip install ccxt pandas pytest
 ```
 
-Run the bot in dry-run mode:
+If you want XGBoost support:
 
 ```bash
-source .venv/bin/activate
+pip install xgboost
+```
+
+## Running the bot
+
+### Dry-run mode (recommended for testing)
+
+```bash
 python3 trader.py
 ```
 
-Run continuously every 60 seconds:
+### Continuous polling
 
 ```bash
 python3 trader.py --poll-seconds 60
 ```
 
-While the bot is running interactively, you can type:
-
-```text
-help
-status
-cashout
-stop
-```
-
-Enable live trading:
+### Live trading
 
 ```bash
 export TRADER_API_KEY=your_key
@@ -52,7 +69,7 @@ export TRADER_API_SECRET=your_secret
 python3 trader.py --execute --order-amount 0.001 --poll-seconds 60
 ```
 
-Use Bybit demo or another CCXT-supported sandbox:
+### Bybit demo trading
 
 ```bash
 export TRADER_API_KEY=your_demo_key
@@ -60,41 +77,112 @@ export TRADER_API_SECRET=your_demo_secret
 python3 trader.py --exchange bybit --demo --execute --order-amount 0.001
 ```
 
-Use a custom state file if you want to separate sessions or symbols:
+### Use a custom state file
 
 ```bash
-python3 trader.py --state-file state/bybit-btcusdt.json --poll-seconds 60
+python3 trader.py --state-file state/bybit-btcusdt-demo.json --poll-seconds 60
 ```
 
-Force a cash-out after a maximum hold time:
+## Recommended conservative command
 
 ```bash
-python3 trader.py --poll-seconds 60 --max-hold 30m
-python3 trader.py --poll-seconds 60 --max-hold 1h
+python3 trader.py \
+  --exchange bybit \
+  --demo \
+  --order-amount 0.001 \
+  --timeframe 4h \
+  --poll-seconds 60 \
+  --stop-loss 0.005 \
+  --take-profit 0.03
 ```
 
-Override strategy settings from the command line:
+## Command-line options
+
+- `--exchange`: CCXT exchange id (default: `binance`)
+- `--symbol`: market symbol (default: `BTC/USDT`)
+- `--timeframe`: candle timeframe (default: `1h`)
+- `--short-window`: short moving-average period (default: `50`)
+- `--long-window`: long moving-average period (default: `200`)
+- `--order-amount`: base asset amount for market orders
+- `--poll-seconds`: seconds between market checks
+- `--order-book-depth`: depth of bids/asks fetched for supervision
+- `--sell-pressure-ratio`: ask/bid volume ratio threshold for exit bias
+- `--state-file`: path to the JSON state file
+- `--max-hold`: max time to hold a position, e.g. `30m`, `1h`
+- `--stop-loss`: stop-loss fraction, e.g. `0.01` for 1%
+- `--take-profit`: take-profit fraction, e.g. `0.02` for 2%
+- `--allow-short`: permit short entries when signal and order book agree
+- `--use-xgboost`: enable optional XGBoost bias filtering
+- `--execute`: place real orders instead of dry-run
+- `--sandbox`: use exchange sandbox/testnet when supported
+- `--demo`: use Bybit demo trading
+
+## How the bot decides
+
+### Entry logic
+
+- `BUY` when the short MA is above the long MA
+- `SELL` when the short MA is below the long MA
+- `BUY` entries require buy-side order-book pressure unless overridden by momentum/price position
+- `SELL` entries require sell-side order-book pressure when shorts are enabled
+- long entries are blocked if the long MA slope is negative
+- short entries are blocked if the long MA slope is positive
+
+### Exit logic
+
+For an open long position, the bot exits when:
+
+- the signal flips to `SELL`
+- the close price hits the stop-loss threshold
+- the close price hits the take-profit threshold
+- order-book sell pressure exceeds the configured ratio
+- momentum turns negative
+
+For an open short position, the bot exits when:
+
+- the signal flips to `BUY`
+- the close price hits the stop-loss threshold
+- the close price hits the take-profit threshold
+- order-book buy pressure exceeds the configured ratio
+- momentum turns positive
+
+## Interactive commands
+
+While the bot is running, type:
+
+- `help` — show commands
+- `status` — print current state
+- `cashout` — exit any open position and terminate
+- `stop` — stop the bot without opening a new trade
+
+## Risk guidance
+
+This bot is intended for demo and paper trading. It is not a production trading system.
+
+- always validate on sandbox/demo before real funds
+- do not use large order sizes until the strategy is proven
+- avoid enabling both `--allow-short` and `--use-xgboost` until you understand the signal behavior
+- start with clean state files and small position sizes
+- run for many trades before considering live risk
+
+## Testing
+
+Run the test suite with:
 
 ```bash
-python3 trader.py --exchange binance --symbol ETH/USDT --timeframe 4h --short-window 20 --long-window 100 --order-amount 0.01
+PYTHONPATH=. pytest -q tests/test_strategy.py
 ```
 
-## Notes
+## Project structure
 
-- Without `--execute`, the bot stays in dry-run mode and only prints the order it would place.
-- `--sandbox` tells CCXT to switch to the exchange's testnet environment when supported.
-- `--demo` enables Bybit demo trading through `api-demo.bybit.com`.
-- Live execution uses market orders for the configured `--order-amount`.
-- The bot now requires both a `BUY` moving-average signal and buy-side order-book pressure before opening a new long position, making entries more conservative.
-- The bot can also open short positions when run with `--allow-short`. In that mode it shorts on a `SELL` signal only when order-book pressure also supports selling.
-- A held long position is sold when either the moving-average signal flips to `SELL` or the top-of-book asks outweigh bids by the configured sell-pressure threshold.
-- A held short position is covered when the signal flips to `BUY` or when buy-side order-book pressure dominates.
-- The bot persists its position state in `bot_state.json` by default, so a restart keeps supervising the previous trade state.
-- Use `--state-file` to isolate state per exchange, symbol, or environment.
-- Use `--max-hold 5m`, `--max-hold 30m`, or `--max-hold 3h` to force a sell once a position has been held that long.
-- Timed cash-outs sell the full persisted position size, not just the configured default order amount.
-- Automatic exits do not stop the bot; it keeps running and can look for the next trade.
-- In an interactive terminal session, `cashout` liquidates the open position immediately, prints profit, and exits. `stop` exits without placing a new order.
-- When a trade closes, the bot prints realized profit based on entry and exit pricing. If the exchange omits fill price or cost fields, the bot falls back to current market prices so profit still shows more reliably.
-- The signal is based on the latest short/long moving-average relationship, not on crossover detection.
-- Exchange APIs, order sizing rules, fees, and market-buy behavior vary. Validate on a paper or sandbox account before using real funds.
+- `trader.py`: entry point
+- `trader_app/config.py`: default settings
+- `trader_app/data.py`: CCXT exchange and market data helpers
+- `trader_app/strategy.py`: signal generation and optional ML bias
+- `trader_app/bot.py`: bot loop, position supervision, execution logic
+- `trader_app/cli.py`: command-line argument handling
+- `tests/test_strategy.py`: strategy and bot regression tests
+
+## Important note
+
+The bot always uses market orders and does not manage exchange fees, slippage, or partial fills beyond the CCXT order response. Real trading carries risk. Use this code for experimentation and learn from demo trading before considering live deployment.

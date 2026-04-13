@@ -4,9 +4,35 @@ from typing import Optional
 
 import ccxt
 import pandas as pd
+import time
 
 
 OHLCV_COLUMNS = ["time", "open", "high", "low", "close", "volume"]
+
+NETWORK_RETRY_EXCEPTIONS = (
+    ccxt.NetworkError,
+    ccxt.RequestTimeout,
+    ccxt.DDoSProtection,
+    ccxt.ExchangeNotAvailable,
+    ccxt.RateLimitExceeded,
+    OSError,
+    TimeoutError,
+)
+
+
+def retry_network_call(callable, max_retries: int = 3, initial_delay: float = 1.0, backoff_factor: float = 2.0, max_delay: float = 10.0):
+    delay = initial_delay
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return callable()
+        except NETWORK_RETRY_EXCEPTIONS as exc:
+            last_exception = exc
+            if attempt == max_retries:
+                raise
+            time.sleep(min(delay, max_delay))
+            delay *= backoff_factor
+    raise last_exception
 
 
 def create_exchange(
@@ -57,16 +83,18 @@ def create_exchange(
 
 
 def fetch_ohlcv_frame(exchange, symbol: str, timeframe: str, limit: int | None = None) -> pd.DataFrame:
-    try:
-        bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except TypeError:
+    def fetch():
         try:
-            if limit is None:
-                bars = exchange.fetch_ohlcv(symbol, timeframe)
-            else:
-                bars = exchange.fetch_ohlcv(symbol, timeframe, limit)
+            return exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except TypeError:
-            bars = exchange.fetch_ohlcv(symbol, timeframe)
+            try:
+                if limit is None:
+                    return exchange.fetch_ohlcv(symbol, timeframe)
+                return exchange.fetch_ohlcv(symbol, timeframe, limit)
+            except TypeError:
+                return exchange.fetch_ohlcv(symbol, timeframe)
+
+    bars = retry_network_call(fetch)
 
     if not bars:
         raise ValueError(
@@ -82,4 +110,5 @@ def fetch_ohlcv_frame(exchange, symbol: str, timeframe: str, limit: int | None =
 def fetch_order_book(exchange, symbol: str, depth: int) -> dict:
     if depth <= 0:
         raise ValueError("order_book_depth must be a positive integer.")
-    return exchange.fetch_order_book(symbol, limit=depth)
+
+    return retry_network_call(lambda: exchange.fetch_order_book(symbol, limit=depth))

@@ -23,6 +23,8 @@ class Settings:
     sell_pressure_ratio: float = 1.2
     state_file: str = "bot_state.json"
     max_hold: str | None = None
+    stop_loss: float = 0.01
+    take_profit: float = 0.02
 
 
 DEFAULT_SETTINGS = Settings()

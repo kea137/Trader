@@ -10,8 +10,44 @@ from typing import Any
 
 import ccxt
 
+ANSI_RESET = "\033[0m"
+ANSI_BOLD = "\033[1m"
+ANSI_RED = "\033[31m"
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_BLUE = "\033[34m"
+ANSI_MAGENTA = "\033[35m"
+ANSI_CYAN = "\033[36m"
+ANSI_WHITE = "\033[37m"
+
+
+def _color_text(text: str, *codes: str) -> str:
+    if not sys.stdout.isatty():
+        return text
+    return "".join(codes) + text + ANSI_RESET
+
+
+def _dashboard_label(text: str) -> str:
+    return _color_text(text, ANSI_BOLD, ANSI_CYAN)
+
+
+def _dashboard_value(text: str, color_code: str | None = None) -> str:
+    if color_code:
+        return _color_text(text, ANSI_BOLD, color_code)
+    return _color_text(text, ANSI_BOLD, ANSI_WHITE)
+
+
+def _command_hint() -> str:
+    return _color_text("[help] [status] [cashout] [stop]", ANSI_BOLD, ANSI_YELLOW)
+
 from trader_app.config import Settings
-from trader_app.data import create_exchange, fetch_ohlcv_frame, fetch_order_book
+from trader_app.data import (
+    create_exchange,
+    fetch_ohlcv_frame,
+    fetch_order_book,
+    retry_network_call,
+    NETWORK_RETRY_EXCEPTIONS,
+)
 from trader_app.strategy import add_moving_averages, latest_signal
 
 
@@ -23,6 +59,7 @@ class BotState:
     entry_price: float | None = None
     entry_amount: float | None = None
     entry_cost: float | None = None
+    last_total_equity: float | None = None
 
 
 @dataclass(frozen=True)
@@ -45,12 +82,21 @@ class MarketSnapshot:
     best_ask: float | None
     long_ma: float
     ml_bias: str | None = None
+    recent_low: float | None = None
+    recent_high: float | None = None
+    price_position: float | None = None
+    momentum: float | None = None
+    volatility: float | None = None
+    order_book_imbalance: float | None = None
+    spread: float | None = None
+    long_ma_slope: float | None = None
 
 
 @dataclass(frozen=True)
 class CycleOutcome:
     message: str
     terminate: bool = False
+    snapshot: "MarketSnapshot" | None = None
 
 
 def read_user_command() -> str | None:
@@ -78,6 +124,7 @@ def load_state(state_file: str) -> BotState:
         entry_price=data.get("entry_price"),
         entry_amount=data.get("entry_amount"),
         entry_cost=data.get("entry_cost"),
+        last_total_equity=data.get("last_total_equity"),
     )
 
 
@@ -97,6 +144,7 @@ def update_state(
     entry_price: float | None,
     entry_amount: float | None,
     entry_cost: float | None,
+    last_total_equity: float | None,
 ) -> bool:
     changed = (
         state.has_position != has_position
@@ -105,6 +153,7 @@ def update_state(
         or state.entry_price != entry_price
         or state.entry_amount != entry_amount
         or state.entry_cost != entry_cost
+        or state.last_total_equity != last_total_equity
     )
     state.has_position = has_position
     state.last_entry_signal = last_entry_signal
@@ -112,6 +161,7 @@ def update_state(
     state.entry_price = entry_price
     state.entry_amount = entry_amount
     state.entry_cost = entry_cost
+    state.last_total_equity = last_total_equity
     return changed
 
 
@@ -160,9 +210,14 @@ def execute_trade(
         )
 
     try:
-        order = exchange.create_order(symbol=symbol, type="market", side=side, amount=amount)
+        order = retry_network_call(lambda: exchange.create_order(symbol=symbol, type="market", side=side, amount=amount))
     except ccxt.AuthenticationError:
         raise
+    except ccxt.NetworkError as exc:
+        return OrderExecution(
+            success=False,
+            message=f"NETWORK_ERROR {signal} {amount} {symbol} {exc}",
+        )
     except ccxt.ExchangeError as exc:
         return OrderExecution(
             success=False,
@@ -209,6 +264,143 @@ def format_realized_profit(state: BotState, exit_execution: OrderExecution) -> s
     return f"profit={pnl:.6f} quote_currency profit_pct={pnl_pct:.2f}%"
 
 
+def _format_equity_delta_text(prior_equity: float | None, current_equity: float | None) -> str:
+    if prior_equity is None or current_equity is None:
+        return ""
+    delta = current_equity - prior_equity
+    return f" equity_delta={delta:+.2f}"
+
+
+def _is_network_outage(exc: BaseException) -> bool:
+    return isinstance(exc, NETWORK_RETRY_EXCEPTIONS)
+
+
+def _safe_balance_value(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, dict):
+        if "total" in value:
+            try:
+                return float(value["total"])
+            except (TypeError, ValueError):
+                pass
+        free = float(value.get("free", 0.0)) if value.get("free") is not None else 0.0
+        used = float(value.get("used", 0.0)) if value.get("used") is not None else 0.0
+        return free + used
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_equity_from_info(info: Any) -> float | None:
+    if info is None:
+        return None
+
+    exact_fields = [
+        "totalEquity",
+        "accountEquity",
+        "equity",
+        "total_equity",
+        "equityTotal",
+        "account_equity",
+        "totalWalletBalance",
+        "equityBalance",
+        "totalBalance",
+        "wallet_balance",
+    ]
+
+    def _search_equity(value: Any) -> float | None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in exact_fields:
+                    try:
+                        return float(child)
+                    except (TypeError, ValueError):
+                        continue
+            for key, child in value.items():
+                lowered = key.lower()
+                if "equity" in lowered or "total" in lowered and "balance" in lowered:
+                    try:
+                        return float(child)
+                    except (TypeError, ValueError):
+                        pass
+            for child in value.values():
+                result = _search_equity(child)
+                if result is not None:
+                    return result
+        elif isinstance(value, list):
+            for item in value:
+                result = _search_equity(item)
+                if result is not None:
+                    return result
+        return None
+
+    return _search_equity(info)
+
+
+def _balance_currency_amount(balance: dict, currency: str) -> float:
+    amount = _safe_balance_value(balance.get(currency))
+    if amount:
+        return amount
+    for section in ("total", "free", "used"):
+        section_value = balance.get(section)
+        if isinstance(section_value, dict):
+            amount = _safe_balance_value(section_value.get(currency))
+            if amount:
+                return amount
+    return 0.0
+
+
+def fetch_total_equity(settings: Settings, exchange: Any, last_price: float | None = None) -> float | None:
+    if not hasattr(exchange, "fetch_balance"):
+        return None
+    try:
+        balance = retry_network_call(lambda: exchange.fetch_balance())
+    except Exception:
+        return None
+
+    info_equity = _extract_equity_from_info(balance.get("info"))
+    if info_equity is not None:
+        return info_equity
+
+    symbol_parts = settings.symbol.replace(" ", "").split("/")
+    if len(symbol_parts) != 2:
+        return None
+
+    base, quote = symbol_parts
+    base_amount = _balance_currency_amount(balance, base)
+    quote_amount = _balance_currency_amount(balance, quote)
+
+    if quote_amount == 0.0 and base_amount == 0.0:
+        return None
+
+    if last_price is None and base_amount != 0.0:
+        return None
+
+    price = last_price if last_price is not None else 0.0
+    return quote_amount + base_amount * price
+
+
+def reward_equity_delta(settings: Settings, state: BotState, snapshot: MarketSnapshot, prior_equity: float | None, current_equity: float | None) -> None:
+    if not settings.use_xgboost:
+        return
+    if prior_equity is None or current_equity is None:
+        return
+
+    equity_delta = current_equity - prior_equity
+    if equity_delta == 0.0:
+        return
+
+    ml_bias = _effective_ml_bias(snapshot)
+    if ml_bias not in {"BUY", "SELL"}:
+        return
+
+    from trader_app.strategy import reward_ml_model
+
+    reward_ml_model(ml_bias, equity_delta)
+
+
 def summarize_order_book(order_book: dict, sell_pressure_ratio: float) -> tuple[float, float, str]:
     bid_volume = sum(level[1] for level in order_book.get("bids", []))
     ask_volume = sum(level[1] for level in order_book.get("asks", []))
@@ -222,32 +414,73 @@ def summarize_order_book(order_book: dict, sell_pressure_ratio: float) -> tuple[
     return bid_volume, ask_volume, "NEUTRAL"
 
 
-def format_decision_summary(snapshot: MarketSnapshot, use_xgboost: bool) -> str:
-    ml_tag = f" ml_bias={snapshot.ml_bias}" if use_xgboost and snapshot.ml_bias is not None else ""
+def _effective_ml_bias(snapshot: MarketSnapshot) -> str | None:
+    ml_bias = getattr(snapshot, "ml_bias", None)
+    if ml_bias in {"BUY", "SELL"}:
+        return ml_bias
+    return None
+
+
+def _can_override_order_book_conflict(snapshot: MarketSnapshot, desired_signal: str) -> bool:
+    if desired_signal == "BUY":
+        return (
+            (snapshot.momentum is not None and snapshot.momentum > 0 and snapshot.price_position is not None and snapshot.price_position <= 0.25)
+            or (snapshot.price_position is not None and snapshot.price_position <= 0.10)
+        )
+    if desired_signal == "SELL":
+        return (
+            (snapshot.momentum is not None and snapshot.momentum < 0 and snapshot.price_position is not None and snapshot.price_position >= 0.75)
+            or (snapshot.price_position is not None and snapshot.price_position >= 0.90)
+        )
+    return False
+
+
+def _should_ignore_ml_conflict(snapshot: MarketSnapshot) -> bool:
     return (
-        f"signal={snapshot.signal} order_book={snapshot.order_book_bias}{ml_tag} "
+        snapshot.price_position is not None
+        and (snapshot.price_position <= 0.10 or snapshot.price_position >= 0.90)
+    ) or snapshot.order_book_bias == snapshot.signal
+
+
+def format_decision_summary(snapshot: MarketSnapshot, use_xgboost: bool) -> str:
+    ml_tag = ""
+    if use_xgboost:
+        ml_bias_value = snapshot.ml_bias if snapshot.ml_bias is not None else "UNAVAILABLE"
+        ml_tag = f" ml_bias={ml_bias_value}"
+    price_position_tag = ""
+    if snapshot.price_position is not None:
+        price_position_tag = f" price_position={snapshot.price_position:.2f}"
+    return (
+        f"signal={snapshot.signal} order_book={snapshot.order_book_bias}{ml_tag}{price_position_tag} "
         f"bids={snapshot.bid_volume:.6f} asks={snapshot.ask_volume:.6f}"
     )
 
 
 def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboost: bool) -> tuple[bool, str]:
+    ml_bias = _effective_ml_bias(snapshot)
+    momentum = getattr(snapshot, "momentum", None)
+
     if snapshot.signal == "BUY":
-        if snapshot.order_book_bias != "BUY":
+        if snapshot.order_book_bias == "SELL" and not _can_override_order_book_conflict(snapshot, "BUY"):
             return False, "order_book_conflict"
-        if snapshot.latest_close <= snapshot.long_ma:
-            return False, "price_below_long_ma"
-        if use_xgboost and snapshot.ml_bias is not None and snapshot.ml_bias != "BUY":
+        if snapshot.long_ma_slope is not None and snapshot.long_ma_slope < 0:
+            return False, "trend_down"
+        if snapshot.price_position is not None and snapshot.price_position >= 0.92:
+            return False, "price_too_high"
+        if use_xgboost and ml_bias is not None and ml_bias != "BUY" and not _should_ignore_ml_conflict(snapshot):
             return False, "ml_conflict"
         return True, "signal_and_order_book"
 
     if snapshot.signal == "SELL":
         if not allow_short:
             return False, "shorts_disabled"
-        if snapshot.order_book_bias != "SELL":
+        if snapshot.order_book_bias == "BUY" and not _can_override_order_book_conflict(snapshot, "SELL"):
             return False, "order_book_conflict"
-        if snapshot.latest_close >= snapshot.long_ma:
-            return False, "price_above_long_ma"
-        if use_xgboost and snapshot.ml_bias is not None and snapshot.ml_bias != "SELL":
+        if snapshot.long_ma_slope is not None and snapshot.long_ma_slope > 0:
+            return False, "trend_up"
+        if snapshot.price_position is not None and snapshot.price_position <= 0.08:
+            return False, "price_too_low"
+        if use_xgboost and ml_bias is not None and ml_bias != "SELL" and not _should_ignore_ml_conflict(snapshot):
             return False, "ml_conflict"
         return True, "signal_and_order_book"
 
@@ -270,13 +503,12 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
     latest_close = float(analyzed.iloc[-1]["close"])
     long_ma = float(analyzed.iloc[-1]["ma_long"])
     ml_bias = None
-    if settings.use_xgboost:
-        from trader_app.strategy import compute_ml_bias
+    from trader_app.strategy import compute_price_position
 
-        try:
-            ml_bias = compute_ml_bias(analyzed, settings.short_window, settings.long_window)
-        except Exception:
-            ml_bias = None
+    recent_low, recent_high, price_position = compute_price_position(frame)
+    previous_close = float(frame.iloc[-2]["close"]) if len(frame) >= 2 else latest_close
+    momentum = latest_close - previous_close
+    volatility = float(frame["close"].rolling(10).std().iloc[-1]) if len(frame) >= 10 else 0.0
     order_book = fetch_order_book(
         exchange=exchange,
         symbol=settings.symbol,
@@ -286,16 +518,55 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
         order_book,
         settings.sell_pressure_ratio,
     )
+    imbalance = 0.0
+    if bid_volume + ask_volume > 0:
+        imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+    spread = 0.0
+    best_bid = order_book.get("bids", [[None]])[0][0] if order_book.get("bids") else None
+    best_ask = order_book.get("asks", [[None]])[0][0] if order_book.get("asks") else None
+    if best_bid is not None and best_ask is not None and best_ask > best_bid:
+        spread = (best_ask - best_bid) / float(best_bid)
+
+    long_ma_slope = None
+    if len(analyzed) >= 3:
+        long_ma_slope = float(analyzed["ma_long"].iloc[-1] - analyzed["ma_long"].iloc[-3])
+
+    if settings.use_xgboost:
+        from trader_app.strategy import compute_ml_bias
+
+        try:
+            ml_bias = compute_ml_bias(
+                analyzed,
+                settings.short_window,
+                settings.long_window,
+                imbalance,
+                spread,
+            )
+        except TypeError:
+            try:
+                ml_bias = compute_ml_bias(analyzed, settings.short_window, settings.long_window)
+            except Exception:
+                ml_bias = "UNAVAILABLE"
+        except Exception:
+            ml_bias = "UNAVAILABLE"
     return MarketSnapshot(
         signal=signal,
         bid_volume=bid_volume,
         ask_volume=ask_volume,
         order_book_bias=order_book_bias,
         latest_close=latest_close,
-        best_bid=order_book.get("bids", [[None]])[0][0] if order_book.get("bids") else None,
-        best_ask=order_book.get("asks", [[None]])[0][0] if order_book.get("asks") else None,
+        best_bid=best_bid,
+        best_ask=best_ask,
         long_ma=long_ma,
         ml_bias=ml_bias,
+        recent_low=recent_low,
+        recent_high=recent_high,
+        price_position=price_position,
+        momentum=momentum,
+        volatility=volatility,
+        order_book_imbalance=imbalance,
+        spread=spread,
+        long_ma_slope=long_ma_slope,
     )
 
 
@@ -304,6 +575,7 @@ def should_exit_position(
     state: BotState,
     max_hold_seconds: int | None,
     now: float,
+    settings: Settings,
 ) -> tuple[bool, str]:
     if (
         max_hold_seconds is not None
@@ -312,23 +584,74 @@ def should_exit_position(
     ):
         return True, "max_hold"
     entry_signal = state.last_entry_signal or "BUY"
+    if state.entry_price is not None:
+        current_price = snapshot.latest_close
+        if entry_signal == "BUY":
+            stop_threshold = state.entry_price * (1 - settings.stop_loss)
+            take_threshold = state.entry_price * (1 + settings.take_profit)
+            if current_price <= stop_threshold + 1e-9:
+                return True, "stop_loss"
+            if current_price >= take_threshold - 1e-9:
+                return True, "take_profit"
+        else:
+            stop_threshold = state.entry_price * (1 + settings.stop_loss)
+            take_threshold = state.entry_price * (1 - settings.take_profit)
+            if current_price >= stop_threshold - 1e-9:
+                return True, "stop_loss"
+            if current_price <= take_threshold + 1e-9:
+                return True, "take_profit"
+    ml_bias = _effective_ml_bias(snapshot)
+    price_position = getattr(snapshot, "price_position", None)
+    if settings.use_xgboost and ml_bias is not None:
+        if entry_signal == "BUY" and ml_bias == "SELL":
+            return True, "ml_signal"
+        if entry_signal == "SELL" and ml_bias == "BUY":
+            return True, "ml_signal"
     if entry_signal == "BUY":
+        if settings.use_xgboost and price_position is not None and price_position >= 0.88:
+            return True, "price_peak"
         if snapshot.signal == "SELL":
             return True, "signal_flip"
         if snapshot.order_book_bias == "SELL":
             return True, "sell_pressure"
+        if snapshot.momentum is not None and snapshot.momentum < 0:
+            return True, "negative_momentum"
         return False, "hold"
     if entry_signal == "SELL":
+        if settings.use_xgboost and price_position is not None and price_position <= 0.12:
+            return True, "price_trough"
         if snapshot.signal == "BUY":
             return True, "signal_flip"
         if snapshot.order_book_bias == "BUY":
             return True, "buy_pressure"
+        if snapshot.momentum is not None and snapshot.momentum > 0:
+            return True, "positive_momentum"
         return False, "hold"
     return False, "hold"
 
 
+def _compute_realized_profit_amount(state: BotState, exit_execution: OrderExecution) -> float | None:
+    entry_cost = state.entry_cost
+    if entry_cost is None and state.entry_price is not None and state.entry_amount is not None:
+        entry_cost = state.entry_price * state.entry_amount
+    exit_cost = exit_execution.cost
+    if exit_cost is None and exit_execution.average_price is not None and exit_execution.filled_amount is not None:
+        exit_cost = exit_execution.average_price * exit_execution.filled_amount
+    if entry_cost is None or exit_cost is None:
+        return None
+    return entry_cost - exit_cost if state.last_entry_signal == "SELL" else exit_cost - entry_cost
+
+
 def liquidate_position(settings: Settings, exchange: Any, state: BotState, reason: str) -> CycleOutcome:
-    snapshot = inspect_market(settings, exchange)
+    try:
+        snapshot = inspect_market(settings, exchange)
+    except Exception as exc:
+        if _is_network_outage(exc):
+            return CycleOutcome(
+                f"OUTAGE | decision=WAIT reason=network_unavailable error={type(exc).__name__}",
+                terminate=False,
+            )
+        raise
     summary = format_decision_summary(snapshot, settings.use_xgboost)
     close_amount = state.entry_amount or settings.order_amount
     close_signal = "SELL" if (state.last_entry_signal or "BUY") == "BUY" else "BUY"
@@ -341,6 +664,18 @@ def liquidate_position(settings: Settings, exchange: Any, state: BotState, reaso
         fallback_price=(snapshot.best_bid if close_signal == "SELL" else snapshot.best_ask) or snapshot.latest_close,
     )
     profit_message = format_realized_profit(state, exit_execution)
+    exit_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+    equity_delta_text = _format_equity_delta_text(state.last_total_equity, exit_equity)
+    if exit_execution.success and exit_equity is not None:
+        state.last_total_equity = exit_equity
+    if exit_execution.success and settings.use_xgboost:
+        from trader_app.strategy import reward_ml_model
+
+        profit_amount = _compute_realized_profit_amount(state, exit_execution)
+        ml_bias = _effective_ml_bias(snapshot)
+        if profit_amount is not None and profit_amount > 0 and ml_bias == state.last_entry_signal:
+            reward_ml_model(ml_bias, profit_amount)
+        reward_equity_delta(settings, state, snapshot, state.last_total_equity, exit_equity)
     if exit_execution.success:
         update_state(
             state,
@@ -350,9 +685,10 @@ def liquidate_position(settings: Settings, exchange: Any, state: BotState, reaso
             entry_price=None,
             entry_amount=None,
             entry_cost=None,
+            last_total_equity=state.last_total_equity,
         )
     return CycleOutcome(
-        f"MANUAL | {summary} decision={close_signal} reason={reason} | {exit_execution.message} | {profit_message}",
+        f"MANUAL | {summary} decision={close_signal} reason={reason} | {exit_execution.message} | {profit_message}{equity_delta_text}",
         terminate=exit_execution.success,
     )
 
@@ -380,10 +716,29 @@ def handle_user_command(settings: Settings, exchange: Any, state: BotState, comm
 def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcome:
     now = time.time()
     max_hold_seconds = parse_duration(settings.max_hold)
-    snapshot = inspect_market(settings, exchange)
+    try:
+        snapshot = inspect_market(settings, exchange)
+    except Exception as exc:
+        if _is_network_outage(exc):
+            return CycleOutcome(
+                f"OUTAGE | decision=WAIT reason=network_unavailable error={type(exc).__name__}",
+                terminate=False,
+            )
+        raise
+
+    prior_equity = state.last_total_equity
+    current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+    if current_equity is not None:
+        state.last_total_equity = current_equity
 
     if state.has_position:
-        should_exit, reason = should_exit_position(snapshot, state, max_hold_seconds, now)
+        should_exit, reason = should_exit_position(
+            snapshot,
+            state,
+            max_hold_seconds,
+            now,
+            settings,
+        )
         if should_exit:
             close_amount = state.entry_amount or settings.order_amount
             entry_signal = state.last_entry_signal or "BUY"
@@ -397,6 +752,19 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                 fallback_price=(snapshot.best_bid if exit_signal == "SELL" else snapshot.best_ask) or snapshot.latest_close,
             )
             profit_message = format_realized_profit(state, exit_execution)
+            exit_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+            equity_delta_text = _format_equity_delta_text(prior_equity, exit_equity)
+            if exit_execution.success and exit_equity is not None:
+                state.last_total_equity = exit_equity
+            if exit_execution.success and settings.use_xgboost:
+                from trader_app.strategy import reward_ml_model
+
+                profit_amount = _compute_realized_profit_amount(state, exit_execution)
+                if profit_amount is not None and profit_amount > 0:
+                    ml_bias = _effective_ml_bias(snapshot)
+                    if ml_bias == state.last_entry_signal:
+                        reward_ml_model(ml_bias, profit_amount)
+                reward_equity_delta(settings, state, snapshot, prior_equity, exit_equity)
             summary = format_decision_summary(snapshot, settings.use_xgboost)
             if exit_execution.success:
                 update_state(
@@ -407,20 +775,36 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                     entry_price=None,
                     entry_amount=None,
                     entry_cost=None,
+                    last_total_equity=state.last_total_equity,
                 )
             return CycleOutcome(
-                f"HOLDING | {summary} decision={exit_signal} reason={reason} | {exit_execution.message} | {profit_message}",
+                f"HOLDING | {summary} decision={exit_signal} reason={reason} | {exit_execution.message} | {profit_message}{equity_delta_text}",
                 terminate=False,
+                snapshot=snapshot,
             )
         summary = format_decision_summary(snapshot, settings.use_xgboost)
+        reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
+        if current_equity is not None:
+            state.last_total_equity = current_equity
         return CycleOutcome(
-            f"HOLDING | {summary} decision=HOLD"
+            f"HOLDING | {summary} decision=HOLD",
+            snapshot=snapshot,
         )
+
+    prior_equity = state.last_total_equity
+    if prior_equity is None:
+        prior_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+        if prior_equity is not None:
+            state.last_total_equity = prior_equity
 
     if snapshot.signal in {"BUY", "SELL"}:
         summary = format_decision_summary(snapshot, settings.use_xgboost)
         enter, reason = should_enter_position(snapshot, settings.allow_short, settings.use_xgboost)
         if not enter:
+            current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+            reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
+            if current_equity is not None:
+                state.last_total_equity = current_equity
             return CycleOutcome(
                 f"FLAT | {summary} decision=WAIT reason={reason}"
             )
@@ -441,14 +825,25 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                 entry_price=entry_execution.average_price,
                 entry_amount=entry_execution.filled_amount,
                 entry_cost=entry_execution.cost,
+                last_total_equity=state.last_total_equity,
             )
+        current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+        reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
+        if current_equity is not None:
+            state.last_total_equity = current_equity
         return CycleOutcome(
-            f"FLAT | {summary} decision={snapshot.signal} | {entry_execution.message}"
+            f"FLAT | {summary} decision={snapshot.signal} | {entry_execution.message}",
+            snapshot=snapshot,
         )
 
     summary = format_decision_summary(snapshot, settings.use_xgboost)
+    current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+    reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
+    if current_equity is not None:
+        state.last_total_equity = current_equity
     return CycleOutcome(
-        f"FLAT | {summary} decision=WAIT"
+        f"FLAT | {summary} decision=WAIT",
+        snapshot=snapshot,
     )
 
 
@@ -487,6 +882,74 @@ def describe_state_file(settings: Settings, state: BotState) -> str:
         f"entry_price={state.entry_price} "
         f"entry_amount={state.entry_amount}"
     )
+
+
+def render_dashboard(settings: Settings, state: BotState, snapshot: MarketSnapshot, outcome_message: str) -> None:
+    position_text = "OPEN" if state.has_position else "FLAT"
+    position_color = ANSI_GREEN if state.has_position else ANSI_YELLOW
+    entry_price = f"{state.entry_price:.4f}" if state.entry_price is not None else "n/a"
+    entry_amount = f"{state.entry_amount:.4f}" if state.entry_amount is not None else "n/a"
+    ml_bias = snapshot.ml_bias if snapshot.ml_bias is not None else "UNAVAILABLE"
+    price_position = f"{snapshot.price_position:.2f}" if snapshot.price_position is not None else "n/a"
+    momentum = f"{snapshot.momentum:.4f}" if snapshot.momentum is not None else "n/a"
+    volatility = f"{snapshot.volatility:.4f}" if snapshot.volatility is not None else "n/a"
+    equity = f"{state.last_total_equity:.2f}" if state.last_total_equity is not None else "n/a"
+    signal_color = ANSI_GREEN if snapshot.signal == "BUY" else ANSI_RED
+    order_book_color = ANSI_GREEN if snapshot.order_book_bias == "BUY" else ANSI_RED if snapshot.order_book_bias == "SELL" else ANSI_YELLOW
+
+    print(_color_text("╔" + "═" * 62 + "╗", ANSI_BOLD, ANSI_CYAN), flush=True)
+    print(
+        _color_text("║ TRADER DASHBOARD", ANSI_BOLD, ANSI_MAGENTA)
+        + _color_text(" " * 41 + "║", ANSI_CYAN),
+        flush=True,
+    )
+    print(_color_text("╠" + "═" * 62 + "╣", ANSI_CYAN), flush=True)
+    print(
+        f"{_dashboard_label('Mode')}: {_dashboard_value(settings.exchange_id, ANSI_GREEN)} "
+        f"{_dashboard_label('Exec')}: {_dashboard_value('live' if settings.execute_orders else 'dry-run', ANSI_GREEN)} "
+        f"{_dashboard_label('Symbol')}: {_dashboard_value(settings.symbol, ANSI_MAGENTA)}",
+        flush=True,
+    )
+    print(
+        f"{_dashboard_label('Position')}: {_dashboard_value(position_text, position_color)} "
+        f"{_dashboard_label('Entry')}: {_dashboard_value(entry_price, ANSI_WHITE)} "
+        f"{_dashboard_label('Size')}: {_dashboard_value(entry_amount, ANSI_WHITE)}",
+        flush=True,
+    )
+    print(
+        f"{_dashboard_label('Signal')}: {_dashboard_value(snapshot.signal, signal_color)} "
+        f"{_dashboard_label('Order')}: {_dashboard_value(snapshot.order_book_bias, order_book_color)} "
+        f"{_dashboard_label('ML')}: {_dashboard_value(ml_bias, ANSI_CYAN)}",
+        flush=True,
+    )
+    print(
+        f"{_dashboard_label('Price')}: {_dashboard_value(f'{snapshot.latest_close:.2f}', ANSI_WHITE)} "
+        f"{_dashboard_label('MA')}: {_dashboard_value(f'{snapshot.long_ma:.2f}', ANSI_WHITE)} "
+        f"{_dashboard_label('Range')}: {_dashboard_value(price_position, ANSI_WHITE)}",
+        flush=True,
+    )
+    print(
+        f"{_dashboard_label('Equity')}: {_dashboard_value(equity, ANSI_GREEN)} "
+        f"{_dashboard_label('SL/TP')}: {_dashboard_value(f'{settings.stop_loss*100:.1f}%/{settings.take_profit*100:.1f}%', ANSI_WHITE)}",
+        flush=True,
+    )
+    print(
+        f"{_dashboard_label('Bids')}: {_dashboard_value(f'{snapshot.bid_volume:.2f}', ANSI_WHITE)} "
+        f"{_dashboard_label('Asks')}: {_dashboard_value(f'{snapshot.ask_volume:.2f}', ANSI_WHITE)} "
+        f"{_dashboard_label('Momentum')}: {_dashboard_value(momentum, ANSI_YELLOW)} "
+        f"{_dashboard_label('Vol')}: {_dashboard_value(volatility, ANSI_YELLOW)}",
+        flush=True,
+    )
+    print(_color_text("╠" + "═" * 62 + "╣", ANSI_CYAN), flush=True)
+    print(
+        f"{_color_text('Last decision:', ANSI_BOLD, ANSI_WHITE)} {_color_text(outcome_message, ANSI_WHITE)}",
+        flush=True,
+    )
+    print(
+        f"{_color_text('Commands:', ANSI_BOLD, ANSI_YELLOW)} {_command_hint()}",
+        flush=True,
+    )
+    print(_color_text("╚" + "═" * 62 + "╝", ANSI_BOLD, ANSI_CYAN), flush=True)
 
 
 def format_auth_error(settings: Settings, exc: Exception) -> str:
@@ -536,12 +999,12 @@ def run_bot(settings: Settings) -> int:
             demo=settings.demo,
         )
 
-        print(describe_mode(settings, exchange=exchange), flush=True)
-        print(describe_state_file(settings, state), flush=True)
-        print("Interactive commands: help, status, cashout, stop", flush=True)
+        print(_color_text(describe_mode(settings, exchange=exchange), ANSI_BOLD, ANSI_MAGENTA), flush=True)
+        print(_color_text(describe_state_file(settings, state), ANSI_BOLD, ANSI_WHITE), flush=True)
+        print(_color_text("Interactive commands:", ANSI_BOLD, ANSI_YELLOW), _command_hint(), flush=True)
         preflight = fetch_exchange_preflight(exchange)
         if preflight:
-            print(preflight, flush=True)
+            print(_color_text(preflight, ANSI_CYAN), flush=True)
 
         while True:
             command = read_user_command()
@@ -553,6 +1016,7 @@ def run_bot(settings: Settings) -> int:
                     entry_price=state.entry_price,
                     entry_amount=state.entry_amount,
                     entry_cost=state.entry_cost,
+                    last_total_equity=state.last_total_equity,
                 )
                 command_outcome = handle_user_command(settings, exchange, state, command)
                 if before_command != state:
@@ -568,11 +1032,15 @@ def run_bot(settings: Settings) -> int:
                 entry_price=state.entry_price,
                 entry_amount=state.entry_amount,
                 entry_cost=state.entry_cost,
+                last_total_equity=state.last_total_equity,
             )
             outcome = run_cycle(settings=settings, exchange=exchange, state=state)
             if before != state:
                 save_state(settings.state_file, state)
-            print(outcome.message, flush=True)
+            if outcome.snapshot is not None:
+                render_dashboard(settings, state, outcome.snapshot, outcome.message)
+            else:
+                print(outcome.message, flush=True)
             if outcome.terminate:
                 break
             if settings.poll_seconds <= 0:

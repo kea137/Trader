@@ -51,6 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum time to hold a position before forcing a sell, for example 30m or 1h.",
     )
     parser.add_argument(
+        "--stop-loss",
+        type=float,
+        default=DEFAULT_SETTINGS.stop_loss,
+        help="Stop-loss fraction for open positions, for example 0.01 for 1%%.",
+    )
+    parser.add_argument(
+        "--take-profit",
+        type=float,
+        default=DEFAULT_SETTINGS.take_profit,
+        help="Take-profit fraction for open positions, for example 0.02 for 2%%.",
+    )
+    parser.add_argument(
         "--allow-short",
         action="store_true",
         help="Allow short entries when the signal and order-book bias indicate a bearish trend.",
@@ -100,6 +112,8 @@ def parse_settings() -> Settings:
         sell_pressure_ratio=args.sell_pressure_ratio,
         state_file=args.state_file,
         max_hold=args.max_hold,
+        stop_loss=args.stop_loss,
+        take_profit=args.take_profit,
     )
 
 

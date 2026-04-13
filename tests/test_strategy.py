@@ -15,6 +15,7 @@ from trader_app.bot import (
     format_realized_profit,
     format_auth_error,
     handle_user_command,
+    fetch_total_equity,
     inspect_market,
     liquidate_position,
     load_state,
@@ -98,7 +99,7 @@ def test_run_cycle_submits_market_sell_when_signal_is_sell():
 
     outcome = run_cycle(settings, exchange, state)
 
-    assert "decision=SELL reason=signal_flip" in outcome.message
+    assert "decision=SELL reason=stop_loss" in outcome.message
     assert "EXECUTED SELL 0.25 BTC/USDT order_id=abc123 status=closed" in outcome.message
     assert "profit=5.000000 quote_currency" in outcome.message
     assert outcome.terminate is False
@@ -113,6 +114,97 @@ def test_run_cycle_submits_market_sell_when_signal_is_sell():
     assert state.has_position is False
 
 
+def test_run_cycle_reports_equity_delta_on_sell():
+    class FakeExchange:
+        id = "fake"
+
+        def __init__(self):
+            self.orders = []
+
+        def fetch_ohlcv(self, symbol, timeframe):
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(300, 0, -1), start=1)]
+
+        def fetch_order_book(self, symbol, limit):
+            return {"bids": [[100, 5]], "asks": [[101, 12]]}
+
+        def create_order(self, symbol, type, side, amount):
+            self.orders.append({"symbol": symbol, "type": type, "side": side, "amount": amount})
+            return {"id": "sell123", "status": "closed", "filled": amount, "average": 100.0, "cost": 25.0}
+
+        def fetch_balance(self):
+            return {"BTC": {"free": 0.0, "used": 0.0}, "USDT": {"free": 1100.0, "used": 0.0}}
+
+    state = BotState(
+        has_position=True,
+        last_entry_signal="BUY",
+        entry_timestamp=0.0,
+        entry_price=100.0,
+        entry_amount=0.25,
+        entry_cost=25.0,
+        last_total_equity=1000.0,
+    )
+    exchange = FakeExchange()
+    settings = Settings(symbol="BTC/USDT", execute_orders=True, order_amount=0.25)
+
+    outcome = run_cycle(settings, exchange, state)
+
+    assert "equity_delta=+100.00" in outcome.message
+    assert state.last_total_equity == 1100.0
+
+
+def test_run_cycle_rewards_model_when_equity_grows_while_holding(monkeypatch):
+    class FakeExchange:
+        id = "fake"
+
+        def fetch_balance(self):
+            return {
+                "info": {"result": {"accountEquity": "1100.0"}},
+                "BTC": {"free": 0.0, "used": 0.0},
+                "USDT": {"free": 1100.0, "used": 0.0},
+            }
+
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=3.0,
+        order_book_bias="BUY",
+        latest_close=109.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        ml_bias="BUY",
+        price_position=0.5,
+        momentum=1.0,
+        volatility=0.1,
+    )
+
+    called = {"signal": None, "amount": 0.0}
+
+    def fake_reward_ml_model(predicted_signal, profit):
+        called["signal"] = predicted_signal
+        called["amount"] = profit
+
+    monkeypatch.setattr("trader_app.strategy.reward_ml_model", fake_reward_ml_model)
+    monkeypatch.setattr("trader_app.bot.inspect_market", lambda settings, exchange: snapshot)
+
+    state = BotState(
+        has_position=True,
+        last_entry_signal="BUY",
+        entry_timestamp=0.0,
+        entry_price=100.0,
+        entry_amount=0.25,
+        entry_cost=25.0,
+        last_total_equity=1000.0,
+    )
+    settings = Settings(symbol="BTC/USDT", execute_orders=False, use_xgboost=True, order_amount=0.25, take_profit=0.20)
+
+    outcome = run_cycle(settings, FakeExchange(), state)
+
+    assert called["signal"] == "BUY"
+    assert called["amount"] == 100.0
+    assert "decision=HOLD" in outcome.message
+
+
 def test_save_and_load_state_round_trip(tmp_path):
     state_file = tmp_path / "bot_state.json"
     state = BotState(
@@ -122,6 +214,7 @@ def test_save_and_load_state_round_trip(tmp_path):
         entry_price=100.0,
         entry_amount=0.5,
         entry_cost=50.0,
+        last_total_equity=1200.0,
     )
 
     save_state(str(state_file), state)
@@ -135,7 +228,92 @@ def test_save_and_load_state_round_trip(tmp_path):
         "entry_timestamp": 123.0,
         "has_position": True,
         "last_entry_signal": "BUY",
+        "last_total_equity": 1200.0,
     }
+
+
+def test_fetch_total_equity_uses_balance_and_price():
+    class FakeExchange:
+        def fetch_balance(self):
+            return {
+                "BTC": {"free": 0.1, "used": 0.0},
+                "USDT": {"free": 1000.0, "used": 0.0},
+            }
+
+    equity = fetch_total_equity(Settings(symbol="BTC/USDT"), FakeExchange(), last_price=20000.0)
+
+    assert equity == 3000.0
+
+
+def test_fetch_total_equity_uses_info_equity_when_available():
+    class FakeExchange:
+        def fetch_balance(self):
+            return {
+                "info": {
+                    "result": {
+                        "accountEquity": "1500.0"
+                    }
+                },
+                "BTC": {"free": 0.0, "used": 0.0},
+                "USDT": {"free": 0.0, "used": 0.0},
+            }
+
+    equity = fetch_total_equity(Settings(symbol="BTC/USDT"), FakeExchange(), last_price=20000.0)
+
+    assert equity == 1500.0
+
+
+def test_fetch_total_equity_uses_nested_info_equity_list():
+    class FakeExchange:
+        def fetch_balance(self):
+            return {
+                "info": {
+                    "result": [
+                        {"equity": "1750.0"}
+                    ]
+                },
+                "BTC": {"free": 0.0, "used": 0.0},
+                "USDT": {"free": 0.0, "used": 0.0},
+            }
+
+    equity = fetch_total_equity(Settings(symbol="BTC/USDT"), FakeExchange(), last_price=20000.0)
+
+    assert equity == 1750.0
+
+
+def test_execute_trade_returns_network_error_after_retries():
+    class FakeExchange:
+        def __init__(self):
+            self.attempts = 0
+
+        def create_order(self, symbol, type, side, amount):
+            self.attempts += 1
+            raise ccxt.NetworkError("connection lost")
+
+    exchange = FakeExchange()
+    execution = execute_trade(exchange, "BTC/USDT", "BUY", 0.01, live=True)
+
+    assert execution.success is False
+    assert "NETWORK_ERROR" in execution.message
+    assert exchange.attempts == 3
+
+
+def test_run_cycle_handles_network_outage_from_market_data():
+    class FakeExchange:
+        id = "fake"
+
+        def fetch_ohlcv(self, symbol, timeframe, limit=None):
+            raise ccxt.NetworkError("connection lost")
+
+        def fetch_order_book(self, symbol, limit):
+            return {"bids": [], "asks": []}
+
+    settings = Settings(symbol="BTC/USDT", execute_orders=False)
+    outcome = run_cycle(settings, FakeExchange(), BotState())
+
+    assert "OUTAGE | decision=WAIT reason=network_unavailable" in outcome.message
+    assert outcome.terminate is False
+    assert outcome.snapshot is None
 
 
 def test_load_state_returns_default_when_file_missing(tmp_path):
@@ -155,6 +333,7 @@ def test_update_state_reports_change_only_when_values_differ():
         entry_price=100.0,
         entry_amount=0.5,
         entry_cost=50.0,
+        last_total_equity=None,
     )
 
     assert changed is True
@@ -165,6 +344,7 @@ def test_update_state_reports_change_only_when_values_differ():
         entry_price=100.0,
         entry_amount=0.5,
         entry_cost=50.0,
+        last_total_equity=None,
     )
     assert update_state(
         state,
@@ -174,6 +354,7 @@ def test_update_state_reports_change_only_when_values_differ():
         entry_price=100.0,
         entry_amount=0.5,
         entry_cost=50.0,
+        last_total_equity=None,
     ) is False
 
 
@@ -277,6 +458,214 @@ def test_inspect_market_uses_ml_bias_when_enabled(monkeypatch):
     assert snapshot.ml_bias == "SELL"
 
 
+def test_inspect_market_reports_unavailable_ml_bias_when_model_fails(monkeypatch):
+    class FakeExchange:
+        id = "fake"
+
+        def fetch_ohlcv(self, symbol, timeframe, limit=None):
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(1, 101), start=1)]
+
+        def fetch_order_book(self, symbol, limit):
+            return {"bids": [[100, 10]], "asks": [[101, 3]]}
+
+    def fake_compute_ml_bias(frame, short_window, long_window):
+        raise ValueError("missing training data")
+
+    monkeypatch.setattr("trader_app.strategy.compute_ml_bias", fake_compute_ml_bias)
+
+    settings = Settings(use_xgboost=True, short_window=5, long_window=20)
+    snapshot = inspect_market(settings, FakeExchange())
+
+    assert snapshot.ml_bias == "UNAVAILABLE"
+
+
+def test_should_enter_position_ignores_unavailable_ml_bias():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=300.0,
+        best_bid=100.0,
+        best_ask=101.0,
+        long_ma=250.0,
+        ml_bias="UNAVAILABLE",
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=True)
+
+    assert enter is True
+    assert reason == "signal_and_order_book"
+
+
+def test_should_enter_position_rejects_buy_when_price_is_too_high():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        price_position=0.95,
+        ml_bias="SELL",
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=True)
+
+    assert enter is False
+    assert reason == "price_too_high"
+
+
+def test_compute_ml_bias_fallbacks_without_xgboost(monkeypatch):
+    from trader_app.strategy import compute_ml_bias
+
+    monkeypatch.setattr("trader_app.strategy.xgb", None)
+
+    frame = pd.DataFrame({"close": list(range(1, 101))})
+    analyzed = add_moving_averages(frame, short_window=5, long_window=20)
+
+    bias = compute_ml_bias(analyzed, 5, 20)
+
+    assert bias in {"BUY", "SELL"}
+
+
+def test_compute_ml_bias_fallbacks_for_default_windows_and_xgboost_unavailable(monkeypatch):
+    from trader_app.strategy import compute_ml_bias
+
+    monkeypatch.setattr("trader_app.strategy.xgb", None)
+
+    frame = pd.DataFrame({"close": list(range(1, 251))})
+    analyzed = add_moving_averages(frame, short_window=50, long_window=200)
+
+    bias = compute_ml_bias(analyzed, 50, 200)
+
+    assert bias in {"BUY", "SELL"}
+
+
+def test_reward_ml_model_updates_preference():
+    from trader_app.strategy import reward_ml_model, ml_bias_preference
+
+    ml_bias_preference["BUY"] = 0.0
+    ml_bias_preference["SELL"] = 0.0
+
+    reward_ml_model("BUY", 10.0)
+    assert ml_bias_preference["BUY"] == 0.1
+
+    reward_ml_model("SELL", -5.0)
+    assert ml_bias_preference["SELL"] == -0.05
+
+
+def test_compute_ml_bias_uses_preference_adjustment_in_fallback(monkeypatch):
+    from trader_app.strategy import compute_ml_bias, ml_bias_preference
+
+    monkeypatch.setattr("trader_app.strategy.xgb", None)
+    ml_bias_preference["BUY"] = 1.0
+    ml_bias_preference["SELL"] = -1.0
+
+    frame = pd.DataFrame({"close": list(range(1, 101))})
+    analyzed = add_moving_averages(frame, short_window=5, long_window=20)
+
+    bias = compute_ml_bias(analyzed, 5, 20)
+    assert bias in {"BUY", "SELL"}
+
+
+def test_compute_price_position_ranges():
+    from trader_app.strategy import compute_price_position
+
+    frame = pd.DataFrame({"close": [100, 95, 105, 90, 110]})
+    low, high, position = compute_price_position(frame, lookback=5)
+
+    assert low == 90.0
+    assert high == 110.0
+    assert position == 1.0
+
+
+def test_should_enter_position_waits_when_price_is_too_high():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        price_position=0.98,
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=True)
+
+    assert enter is False
+    assert reason == "price_too_high"
+
+
+def test_should_enter_position_allows_buy_when_order_book_is_opposed_but_momentum_positive():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=20,
+        order_book_bias="SELL",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        price_position=0.10,
+        momentum=2.0,
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=False)
+
+    assert enter is True
+    assert reason == "signal_and_order_book"
+
+
+def test_should_enter_position_allows_neutral_order_book_with_positive_signal():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="NEUTRAL",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        price_position=0.60,
+        momentum=1.0,
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=False)
+
+    assert enter is True
+    assert reason == "signal_and_order_book"
+
+
+def test_should_exit_position_on_price_peak():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        price_position=0.92,
+    )
+
+    should_exit, reason = should_exit_position(
+        snapshot,
+        BotState(has_position=True, last_entry_signal="BUY", entry_timestamp=0.0),
+        None,
+        10.0,
+        Settings(use_xgboost=True),
+    )
+
+    assert should_exit is True
+    assert reason == "price_peak"
+
+
 def test_should_enter_position_requires_order_book_confirmation():
     snapshot = MarketSnapshot(
         signal="BUY",
@@ -337,7 +726,8 @@ def test_run_cycle_shorts_when_flat_and_signal_is_sell():
             self.orders = []
 
         def fetch_ohlcv(self, symbol, timeframe):
-            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(300, 0, -1), start=1)]
+            prices = list(range(300, 50, -1)) + [60, 65, 70, 75, 80]
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(prices, start=1)]
 
         def fetch_order_book(self, symbol, limit):
             return {"bids": [[100, 1]], "asks": [[101, 4]]}
@@ -368,10 +758,153 @@ def test_should_exit_position_sells_on_bearish_order_book():
         BotState(has_position=True, entry_timestamp=0.0),
         None,
         10.0,
+        Settings(use_xgboost=False),
     )
 
     assert should_exit is True
     assert reason == "sell_pressure"
+
+
+def test_should_exit_position_sells_when_ml_bias_reverses():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=300.0,
+        best_bid=100.0,
+        best_ask=101.0,
+        long_ma=250.0,
+        ml_bias="SELL",
+    )
+
+    should_exit, reason = should_exit_position(
+        snapshot,
+        BotState(has_position=True, last_entry_signal="BUY", entry_timestamp=0.0),
+        None,
+        10.0,
+        Settings(use_xgboost=True),
+    )
+
+    assert should_exit is True
+    assert reason == "ml_signal"
+
+
+def test_should_exit_position_respects_long_stop_loss():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=95.0,
+        best_bid=94.0,
+        best_ask=96.0,
+        long_ma=100.0,
+    )
+
+    should_exit, reason = should_exit_position(
+        snapshot,
+        BotState(has_position=True, last_entry_signal="BUY", entry_price=100.0, entry_timestamp=0.0),
+        None,
+        10.0,
+        Settings(use_xgboost=False, stop_loss=0.05, take_profit=0.10),
+    )
+
+    assert should_exit is True
+    assert reason == "stop_loss"
+
+
+def test_should_exit_position_reaches_long_take_profit():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+    )
+
+    should_exit, reason = should_exit_position(
+        snapshot,
+        BotState(has_position=True, last_entry_signal="BUY", entry_price=100.0, entry_timestamp=0.0),
+        None,
+        10.0,
+        Settings(use_xgboost=False, stop_loss=0.05, take_profit=0.10),
+    )
+
+    assert should_exit is True
+    assert reason == "take_profit"
+
+
+def test_should_exit_position_respects_short_stop_loss():
+    snapshot = MarketSnapshot(
+        signal="SELL",
+        bid_volume=5,
+        ask_volume=10,
+        order_book_bias="SELL",
+        latest_close=105.0,
+        best_bid=104.0,
+        best_ask=106.0,
+        long_ma=100.0,
+    )
+
+    should_exit, reason = should_exit_position(
+        snapshot,
+        BotState(has_position=True, last_entry_signal="SELL", entry_price=100.0, entry_timestamp=0.0),
+        None,
+        10.0,
+        Settings(use_xgboost=False, stop_loss=0.05, take_profit=0.10),
+    )
+
+    assert should_exit is True
+    assert reason == "stop_loss"
+
+
+def test_should_exit_position_reaches_short_take_profit():
+    snapshot = MarketSnapshot(
+        signal="SELL",
+        bid_volume=5,
+        ask_volume=10,
+        order_book_bias="SELL",
+        latest_close=90.0,
+        best_bid=89.0,
+        best_ask=91.0,
+        long_ma=100.0,
+    )
+
+    should_exit, reason = should_exit_position(
+        snapshot,
+        BotState(has_position=True, last_entry_signal="SELL", entry_price=100.0, entry_timestamp=0.0),
+        None,
+        10.0,
+        Settings(use_xgboost=False, stop_loss=0.05, take_profit=0.10),
+    )
+
+    assert should_exit is True
+    assert reason == "take_profit"
+
+
+def test_should_enter_position_rejects_long_when_long_ma_slopes_down():
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10,
+        ask_volume=5,
+        order_book_bias="BUY",
+        latest_close=110.0,
+        best_bid=109.0,
+        best_ask=111.0,
+        long_ma=100.0,
+        price_position=0.50,
+        momentum=1.0,
+        long_ma_slope=-0.5,
+    )
+
+    enter, reason = should_enter_position(snapshot, allow_short=False, use_xgboost=False)
+
+    assert enter is False
+    assert reason == "trend_down"
 
 
 def test_should_exit_position_sells_when_max_hold_expires():
@@ -384,6 +917,7 @@ def test_should_exit_position_sells_when_max_hold_expires():
         BotState(has_position=True, entry_timestamp=0.0),
         1800,
         1800.0,
+        Settings(use_xgboost=False),
     )
 
     assert should_exit is True
@@ -398,7 +932,8 @@ def test_run_cycle_buys_when_flat_and_signal_is_buy():
             self.orders = []
 
         def fetch_ohlcv(self, symbol, timeframe):
-            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(range(1, 301), start=1)]
+            prices = list(range(40, 240)) + [190] * 100
+            return [[index * 60_000, 0, 0, 0, price, 0] for index, price in enumerate(prices, start=1)]
 
         def fetch_order_book(self, symbol, limit):
             return {"bids": [[100, 9]], "asks": [[101, 4]]}
