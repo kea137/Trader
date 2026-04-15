@@ -227,6 +227,7 @@ def test_save_and_load_state_round_trip(tmp_path):
         "entry_price": 100.0,
         "entry_timestamp": 123.0,
         "has_position": True,
+        "last_candle_time": None,
         "last_entry_signal": "BUY",
         "last_total_equity": 1200.0,
     }
@@ -519,11 +520,19 @@ def test_should_enter_position_rejects_buy_when_price_is_too_high():
 
 
 def test_compute_ml_bias_fallbacks_without_xgboost(monkeypatch):
+    import numpy as np
     from trader_app.strategy import compute_ml_bias
 
     monkeypatch.setattr("trader_app.strategy.xgb", None)
 
-    frame = pd.DataFrame({"close": list(range(1, 101))})
+    rng = np.random.RandomState(42)
+    prices = 50.0 + np.cumsum(rng.randn(100) * 0.5)
+    frame = pd.DataFrame({
+        "close": prices,
+        "high": prices + rng.uniform(0, 1, 100),
+        "low": prices - rng.uniform(0, 1, 100),
+        "volume": rng.uniform(10, 100, 100),
+    })
     analyzed = add_moving_averages(frame, short_window=5, long_window=20)
 
     bias = compute_ml_bias(analyzed, 5, 20)

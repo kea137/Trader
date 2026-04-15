@@ -885,20 +885,6 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
             state.last_total_equity = prior_equity
 
     if snapshot.signal in {"BUY", "SELL"}:
-        if (
-            snapshot.latest_bar_time is not None
-            and state.last_candle_time is not None
-            and snapshot.latest_bar_time == state.last_candle_time
-            and not state.has_position
-        ):
-            summary = format_decision_summary(snapshot, settings.use_xgboost)
-            current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
-            reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
-            if current_equity is not None:
-                state.last_total_equity = current_equity
-            return CycleOutcome(
-                f"FLAT | {summary} decision=WAIT reason=same_candle"
-            )
         summary = format_decision_summary(snapshot, settings.use_xgboost)
         enter, reason = should_enter_position(snapshot, settings.allow_short, settings.use_xgboost)
         if not enter:
@@ -906,18 +892,6 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
             reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
             if current_equity is not None:
                 state.last_total_equity = current_equity
-            if snapshot.latest_bar_time is not None and snapshot.latest_bar_time != state.last_candle_time:
-                update_state(
-                    state,
-                    has_position=state.has_position,
-                    last_entry_signal=state.last_entry_signal,
-                    entry_timestamp=state.entry_timestamp,
-                    entry_price=state.entry_price,
-                    entry_amount=state.entry_amount,
-                    entry_cost=state.entry_cost,
-                    last_total_equity=state.last_total_equity,
-                    last_candle_time=snapshot.latest_bar_time,
-                )
             return CycleOutcome(
                 f"FLAT | {summary} decision=WAIT reason={reason}"
             )
