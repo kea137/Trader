@@ -77,10 +77,10 @@ export TRADER_API_SECRET=your_demo_secret
 python3 trader.py --exchange bybit --demo --execute --order-amount 0.001
 ```
 
-### Use a custom state file
+### Use a custom state file or record file
 
 ```bash
-python3 trader.py --state-file state/bybit-btcusdt-demo.json --poll-seconds 60
+python3 trader.py --state-file state/bybit-btcusdt-demo.json --record-file logs/bybit-btcusdt.csv --poll-seconds 60
 ```
 
 ## Recommended conservative command
@@ -108,6 +108,7 @@ python3 trader.py \
 - `--order-book-depth`: depth of bids/asks fetched for supervision
 - `--sell-pressure-ratio`: ask/bid volume ratio threshold for exit bias
 - `--state-file`: path to the JSON state file
+- `--record-file`: path to a CSV file that logs market snapshots and equity records each cycle
 - `--max-hold`: max time to hold a position, e.g. `30m`, `1h`
 - `--stop-loss`: stop-loss fraction, e.g. `0.01` for 1%
 - `--take-profit`: take-profit fraction, e.g. `0.02` for 2%

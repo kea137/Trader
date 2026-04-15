@@ -22,6 +22,7 @@ class Settings:
     order_book_depth: int = 5
     sell_pressure_ratio: float = 1.2
     state_file: str = "bot_state.json"
+    record_file: str | None = None
     max_hold: str | None = None
     stop_loss: float = 0.01
     take_profit: float = 0.02

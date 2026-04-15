@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import select
 import sys
@@ -182,6 +183,82 @@ def parse_duration(value: str | None) -> int | None:
     if seconds <= 0:
         raise ValueError("max_hold must be greater than zero.")
     return seconds
+
+
+def _write_trade_record(path: Path, record: dict[str, Any]) -> None:
+    exists = path.exists() and path.stat().st_size > 0
+    fieldnames = [
+        "timestamp",
+        "signal",
+        "order_book_bias",
+        "latest_close",
+        "best_bid",
+        "best_ask",
+        "long_ma",
+        "price_position",
+        "momentum",
+        "volatility",
+        "spread",
+        "long_ma_slope",
+        "order_book_imbalance",
+        "has_position",
+        "entry_signal",
+        "entry_price",
+        "entry_amount",
+        "last_total_equity",
+        "decision",
+        "outcome",
+    ]
+    with path.open("a", newline="") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerow(record)
+
+
+def _format_record_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def record_trade_snapshot(
+    settings: Settings,
+    state: BotState,
+    snapshot: MarketSnapshot,
+    decision: str | None = None,
+    outcome: str = "",
+) -> None:
+    if not settings.record_file:
+        return
+    path = Path(settings.record_file)
+    if path.parent and path.parent != Path('.'):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "signal": snapshot.signal,
+        "order_book_bias": snapshot.order_book_bias,
+        "latest_close": snapshot.latest_close,
+        "best_bid": _format_record_value(snapshot.best_bid),
+        "best_ask": _format_record_value(snapshot.best_ask),
+        "long_ma": snapshot.long_ma,
+        "price_position": _format_record_value(snapshot.price_position),
+        "momentum": _format_record_value(snapshot.momentum),
+        "volatility": _format_record_value(snapshot.volatility),
+        "spread": _format_record_value(snapshot.spread),
+        "long_ma_slope": _format_record_value(snapshot.long_ma_slope),
+        "order_book_imbalance": _format_record_value(snapshot.order_book_imbalance),
+        "has_position": state.has_position,
+        "entry_signal": _format_record_value(state.last_entry_signal),
+        "entry_price": _format_record_value(state.entry_price),
+        "entry_amount": _format_record_value(state.entry_amount),
+        "last_total_equity": _format_record_value(state.last_total_equity),
+        "decision": decision or "",
+        "outcome": outcome,
+    }
+    _write_trade_record(path, record)
 
 
 def execute_trade(
@@ -1038,6 +1115,10 @@ def run_bot(settings: Settings) -> int:
             if before != state:
                 save_state(settings.state_file, state)
             if outcome.snapshot is not None:
+                decision = None
+                if "decision=" in outcome.message:
+                    decision = outcome.message.split("decision=")[1].split()[0].strip()
+                record_trade_snapshot(settings, state, outcome.snapshot, decision=decision, outcome=outcome.message)
                 render_dashboard(settings, state, outcome.snapshot, outcome.message)
             else:
                 print(outcome.message, flush=True)

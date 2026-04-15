@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the JSON file used to persist the bot's trade state across restarts.",
     )
     parser.add_argument(
+        "--record-file",
+        default=DEFAULT_SETTINGS.record_file,
+        help="Append market snapshots and equity records to a CSV file during each cycle.",
+    )
+    parser.add_argument(
         "--max-hold",
         default=DEFAULT_SETTINGS.max_hold,
         help="Maximum time to hold a position before forcing a sell, for example 30m or 1h.",
@@ -111,6 +116,7 @@ def parse_settings() -> Settings:
         order_book_depth=args.order_book_depth,
         sell_pressure_ratio=args.sell_pressure_ratio,
         state_file=args.state_file,
+        record_file=args.record_file,
         max_hold=args.max_hold,
         stop_loss=args.stop_loss,
         take_profit=args.take_profit,
