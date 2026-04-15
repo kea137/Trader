@@ -61,6 +61,7 @@ class BotState:
     entry_amount: float | None = None
     entry_cost: float | None = None
     last_total_equity: float | None = None
+    last_candle_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +92,7 @@ class MarketSnapshot:
     order_book_imbalance: float | None = None
     spread: float | None = None
     long_ma_slope: float | None = None
+    latest_bar_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,7 @@ def load_state(state_file: str) -> BotState:
         entry_amount=data.get("entry_amount"),
         entry_cost=data.get("entry_cost"),
         last_total_equity=data.get("last_total_equity"),
+        last_candle_time=data.get("last_candle_time"),
     )
 
 
@@ -146,6 +149,7 @@ def update_state(
     entry_amount: float | None,
     entry_cost: float | None,
     last_total_equity: float | None,
+    last_candle_time: float | None = None,
 ) -> bool:
     changed = (
         state.has_position != has_position
@@ -155,6 +159,7 @@ def update_state(
         or state.entry_amount != entry_amount
         or state.entry_cost != entry_cost
         or state.last_total_equity != last_total_equity
+        or state.last_candle_time != last_candle_time
     )
     state.has_position = has_position
     state.last_entry_signal = last_entry_signal
@@ -163,6 +168,7 @@ def update_state(
     state.entry_amount = entry_amount
     state.entry_cost = entry_cost
     state.last_total_equity = last_total_equity
+    state.last_candle_time = last_candle_time
     return changed
 
 
@@ -608,6 +614,8 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
     if len(analyzed) >= 3:
         long_ma_slope = float(analyzed["ma_long"].iloc[-1] - analyzed["ma_long"].iloc[-3])
 
+    latest_bar_time = float(frame["time"].iloc[-1].timestamp())
+
     if settings.use_xgboost:
         from trader_app.strategy import compute_ml_bias
 
@@ -644,6 +652,7 @@ def inspect_market(settings: Settings, exchange: Any) -> MarketSnapshot:
         order_book_imbalance=imbalance,
         spread=spread,
         long_ma_slope=long_ma_slope,
+        latest_bar_time=latest_bar_time,
     )
 
 
@@ -691,7 +700,7 @@ def should_exit_position(
             return True, "signal_flip"
         if snapshot.order_book_bias == "SELL":
             return True, "sell_pressure"
-        if snapshot.momentum is not None and snapshot.momentum < 0:
+        if snapshot.momentum is not None and snapshot.momentum < 0 and snapshot.order_book_bias == "SELL":
             return True, "negative_momentum"
         return False, "hold"
     if entry_signal == "SELL":
@@ -853,6 +862,7 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                     entry_amount=None,
                     entry_cost=None,
                     last_total_equity=state.last_total_equity,
+                    last_candle_time=snapshot.latest_bar_time,
                 )
             return CycleOutcome(
                 f"HOLDING | {summary} decision={exit_signal} reason={reason} | {exit_execution.message} | {profit_message}{equity_delta_text}",
@@ -875,6 +885,20 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
             state.last_total_equity = prior_equity
 
     if snapshot.signal in {"BUY", "SELL"}:
+        if (
+            snapshot.latest_bar_time is not None
+            and state.last_candle_time is not None
+            and snapshot.latest_bar_time == state.last_candle_time
+            and not state.has_position
+        ):
+            summary = format_decision_summary(snapshot, settings.use_xgboost)
+            current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
+            reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
+            if current_equity is not None:
+                state.last_total_equity = current_equity
+            return CycleOutcome(
+                f"FLAT | {summary} decision=WAIT reason=same_candle"
+            )
         summary = format_decision_summary(snapshot, settings.use_xgboost)
         enter, reason = should_enter_position(snapshot, settings.allow_short, settings.use_xgboost)
         if not enter:
@@ -882,6 +906,18 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
             reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
             if current_equity is not None:
                 state.last_total_equity = current_equity
+            if snapshot.latest_bar_time is not None and snapshot.latest_bar_time != state.last_candle_time:
+                update_state(
+                    state,
+                    has_position=state.has_position,
+                    last_entry_signal=state.last_entry_signal,
+                    entry_timestamp=state.entry_timestamp,
+                    entry_price=state.entry_price,
+                    entry_amount=state.entry_amount,
+                    entry_cost=state.entry_cost,
+                    last_total_equity=state.last_total_equity,
+                    last_candle_time=snapshot.latest_bar_time,
+                )
             return CycleOutcome(
                 f"FLAT | {summary} decision=WAIT reason={reason}"
             )
@@ -903,6 +939,7 @@ def run_cycle(settings: Settings, exchange: Any, state: BotState) -> CycleOutcom
                 entry_amount=entry_execution.filled_amount,
                 entry_cost=entry_execution.cost,
                 last_total_equity=state.last_total_equity,
+                last_candle_time=snapshot.latest_bar_time,
             )
         current_equity = fetch_total_equity(settings, exchange, snapshot.latest_close)
         reward_equity_delta(settings, state, snapshot, prior_equity, current_equity)
