@@ -38,7 +38,7 @@ class Settings:
     loss_cooldown: int = 0
     # — confluence & volume —
     confluence_threshold: int = 0
-    volume_confirmation: bool = False
+    volume_confirmation: bool = False  # applies -1 confluence penalty when volume is below 20-period average
     # — drawdown protection —
     max_daily_loss: float = 0.0
     max_drawdown: float = 0.0

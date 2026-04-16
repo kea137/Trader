@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import json
+import queue as _queue_module
 import select
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,8 +40,105 @@ def _dashboard_value(text: str, color_code: str | None = None) -> str:
     return _color_text(text, ANSI_BOLD, ANSI_WHITE)
 
 
-def _command_hint() -> str:
-    return _color_text("[help] [status] [cashout] [stop]", ANSI_BOLD, ANSI_YELLOW)
+ANSI_CLEAR_SCREEN = "\033[2J\033[H"
+
+_TRABOT_ART = [
+    "████████╗██████╗  █████╗ ██████╗  ██████╗ ████████╗",
+    "╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
+    "   ██║   ██████╔╝███████║██████╔╝██║   ██║   ██║   ",
+    "   ██║   ██╔══██╗██╔══██║██╔══██╗██║   ██║   ██║   ",
+    "   ██║   ██║  ██║██║  ██║██████╔╝╚██████╔╝   ██║   ",
+    "   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝   ╚═╝   ",
+]
+
+# Thread-safe queue for commands typed by the user.
+_command_queue: _queue_module.Queue[str] = _queue_module.Queue()
+
+
+def _print_splash() -> None:
+    """Print the TRABOT splash screen on startup (TTY only)."""
+    if not sys.stdout.isatty():
+        return
+    sys.stdout.write(ANSI_CLEAR_SCREEN)
+    sys.stdout.flush()
+    print()
+    for line in _TRABOT_ART:
+        print(_color_text("  " + line, ANSI_BOLD, ANSI_MAGENTA), flush=True)
+    print()
+    print(_color_text("  Automated Trading Bot  ·  type  help  to begin", ANSI_BOLD, ANSI_CYAN), flush=True)
+    print()
+
+
+def _run_input_thread() -> None:
+    """Background thread: block on stdin and push each line to the command queue."""
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            cmd = line.strip().lower()
+            if cmd:
+                _command_queue.put(cmd)
+    except Exception:
+        pass
+
+
+def _start_input_thread() -> None:
+    """Start the background input reader thread if stdin is a TTY."""
+    if not sys.stdin or sys.stdin.closed or not sys.stdin.isatty():
+        return
+    t = threading.Thread(target=_run_input_thread, daemon=True)
+    t.start()
+
+
+def _read_trade_history(record_file: str, n: int = 12) -> list[dict]:
+    """Return the last *n* rows from the record CSV, newest first."""
+    path = Path(record_file)
+    if not path.exists():
+        return []
+    try:
+        with path.open(newline="") as fh:
+            reader = csv.DictReader(fh)
+            rows = list(reader)
+        return list(reversed(rows[-n:]))
+    except Exception:
+        return []
+
+
+def _format_history_lines(rows: list[dict], inner_width: int = 62) -> list[str]:
+    """Format trade history rows into display lines that fit inside the dashboard box."""
+    if not rows:
+        return ["  no records found"]
+    col_ts = 16
+    col_dec = 10
+    col_sig = 6
+    col_price = 10
+    col_equity = 10
+    header = (
+        f"  {'Timestamp':<{col_ts}}  {'Decision':<{col_dec}}  "
+        f"{'Signal':<{col_sig}}  {'Price':>{col_price}}  {'Equity':>{col_equity}}"
+    )
+    sep = "  " + "─" * (inner_width - 4)
+    lines: list[str] = [header, sep]
+    for row in rows:
+        ts = str(row.get("timestamp", ""))[:col_ts]
+        dec = str(row.get("decision", ""))[:col_dec]
+        sig = str(row.get("signal", ""))[:col_sig]
+        try:
+            price = f"{float(row.get('latest_close', 0)):.2f}"[:col_price]
+        except (ValueError, TypeError):
+            price = str(row.get("latest_close", ""))[:col_price]
+        try:
+            equity = f"{float(row.get('last_total_equity', 0)):.2f}"[:col_equity]
+        except (ValueError, TypeError):
+            equity = str(row.get("last_total_equity", ""))[:col_equity]
+        line = (
+            f"  {ts:<{col_ts}}  {dec:<{col_dec}}  "
+            f"{sig:<{col_sig}}  {price:>{col_price}}  {equity:>{col_equity}}"
+        )
+        lines.append(line[:inner_width])
+    return lines
+
 
 from trader_app.config import Settings
 from trader_app.data import (
@@ -107,15 +206,11 @@ class CycleOutcome:
 
 
 def read_user_command() -> str | None:
-    if not sys.stdin or sys.stdin.closed or not sys.stdin.isatty():
+    """Poll the command queue for a pending user command (non-blocking)."""
+    try:
+        return _command_queue.get_nowait()
+    except _queue_module.Empty:
         return None
-    readable, _, _ = select.select([sys.stdin], [], [], 0)
-    if not readable:
-        return None
-    command = sys.stdin.readline()
-    if not command:
-        return None
-    return command.strip().lower()
 
 
 def load_state(state_file: str) -> BotState:
@@ -548,16 +643,23 @@ def should_enter_position(snapshot: MarketSnapshot, allow_short: bool, use_xgboo
     ml_bias = _effective_ml_bias(snapshot)
     momentum = getattr(snapshot, "momentum", None)
 
-    # Volume confirmation gate
-    if settings is not None and settings.volume_confirmation:
-        if snapshot.volume_confirmed is not None and not snapshot.volume_confirmed:
-            return False, "low_volume"
+    # Compute effective confluence score, applying a -1 penalty when
+    # volume_confirmation is enabled and current volume is below average.
+    # This makes low-volume entries harder (not impossible) — other strong
+    # indicators can still compensate.
+    raw_score = snapshot.confluence_score if snapshot.confluence_score is not None else 0
+    if (
+        settings is not None
+        and settings.volume_confirmation
+        and snapshot.volume_confirmed is not None
+        and not snapshot.volume_confirmed
+    ):
+        raw_score = max(0, raw_score - 1)
 
     # Confluence gate
     if settings is not None and settings.confluence_threshold > 0:
-        score = snapshot.confluence_score if snapshot.confluence_score is not None else 0
-        if score < settings.confluence_threshold:
-            return False, f"low_confluence_{score}"
+        if raw_score < settings.confluence_threshold:
+            return False, f"low_confluence_{raw_score}"
 
     if snapshot.signal == "BUY":
         if snapshot.order_book_bias == "SELL" and not _can_override_order_book_conflict(snapshot, "BUY"):
@@ -821,11 +923,17 @@ def liquidate_position(settings: Settings, exchange: Any, state: BotState, reaso
 def handle_user_command(settings: Settings, exchange: Any, state: BotState, command: str) -> CycleOutcome:
     if command in {"help", "?"}:
         return CycleOutcome(
-            "COMMANDS | help | status | cashout | stop",
+            "COMMANDS | help | status | history | cashout | stop",
             terminate=False,
         )
     if command == "status":
         return CycleOutcome(describe_state_file(settings, state), terminate=False)
+    if command in {"history", "hist"}:
+        if not settings.record_file:
+            return CycleOutcome("history | no record file configured (use --record-file)", terminate=False)
+        rows = _read_trade_history(settings.record_file)
+        lines = _format_history_lines(rows)
+        return CycleOutcome("\n".join(lines), terminate=False)
     if command == "cashout":
         if not state.has_position:
             return CycleOutcome("MANUAL | no open position | decision=STOP", terminate=True)
@@ -833,7 +941,7 @@ def handle_user_command(settings: Settings, exchange: Any, state: BotState, comm
     if command == "stop":
         return CycleOutcome("MANUAL | stop requested | decision=STOP", terminate=True)
     return CycleOutcome(
-        f"COMMANDS | unknown command={command} | valid=help,status,cashout,stop",
+        f"COMMANDS | unknown command={command} | valid=help,status,history,cashout,stop",
         terminate=False,
     )
 
@@ -1027,7 +1135,20 @@ def describe_state_file(settings: Settings, state: BotState) -> str:
     )
 
 
-def render_dashboard(settings: Settings, state: BotState, snapshot: MarketSnapshot, outcome_message: str) -> None:
+def render_dashboard(
+    settings: Settings,
+    state: BotState,
+    snapshot: MarketSnapshot,
+    outcome_message: str,
+    last_command_output: str = "",
+) -> None:
+    W = 62  # inner box width
+
+    # Clear screen and redraw from top on TTY; plain append otherwise.
+    if sys.stdout.isatty():
+        sys.stdout.write(ANSI_CLEAR_SCREEN)
+        sys.stdout.flush()
+
     position_text = "OPEN" if state.has_position else "FLAT"
     position_color = ANSI_GREEN if state.has_position else ANSI_YELLOW
     entry_price = f"{state.entry_price:.4f}" if state.entry_price is not None else "n/a"
@@ -1038,71 +1159,105 @@ def render_dashboard(settings: Settings, state: BotState, snapshot: MarketSnapsh
     volatility = f"{snapshot.volatility:.4f}" if snapshot.volatility is not None else "n/a"
     equity = f"{state.last_total_equity:.2f}" if state.last_total_equity is not None else "n/a"
     signal_color = ANSI_GREEN if snapshot.signal == "BUY" else ANSI_RED
-    order_book_color = ANSI_GREEN if snapshot.order_book_bias == "BUY" else ANSI_RED if snapshot.order_book_bias == "SELL" else ANSI_YELLOW
-
+    order_book_color = (
+        ANSI_GREEN if snapshot.order_book_bias == "BUY"
+        else ANSI_RED if snapshot.order_book_bias == "SELL"
+        else ANSI_YELLOW
+    )
     macd_text = f"{snapshot.macd_histogram:.4f}" if snapshot.macd_histogram is not None else "n/a"
     confluence_text = str(snapshot.confluence_score) if snapshot.confluence_score is not None else "n/a"
     vol_text = "YES" if snapshot.volume_confirmed else "NO" if snapshot.volume_confirmed is not None else "n/a"
+    vol_color = ANSI_GREEN if snapshot.volume_confirmed else ANSI_RED
+    timestamp = time.strftime("%H:%M:%S")
 
-    print(_color_text("╔" + "═" * 62 + "╗", ANSI_BOLD, ANSI_CYAN), flush=True)
+    # ── header ──────────────────────────────────────────────────────────────
+    title = (
+        f" TRABOT  ·  {settings.symbol}  ·  {settings.exchange_id}"
+        f"  ·  {'live' if settings.execute_orders else 'dry-run'}  ·  {timestamp}"
+    )
+    title_padded = title[:W].ljust(W)
+    print(_color_text("╔" + "═" * W + "╗", ANSI_BOLD, ANSI_CYAN), flush=True)
     print(
-        _color_text("║ TRADER DASHBOARD", ANSI_BOLD, ANSI_MAGENTA)
-        + _color_text(" " * 41 + "║", ANSI_CYAN),
+        _color_text("║", ANSI_CYAN)
+        + _color_text(title_padded, ANSI_BOLD, ANSI_MAGENTA)
+        + _color_text("║", ANSI_CYAN),
         flush=True,
     )
-    print(_color_text("╠" + "═" * 62 + "╣", ANSI_CYAN), flush=True)
+    print(_color_text("╠" + "═" * W + "╣", ANSI_CYAN), flush=True)
+
+    # ── data rows ────────────────────────────────────────────────────────────
     print(
-        f"{_dashboard_label('Mode')}: {_dashboard_value(settings.exchange_id, ANSI_GREEN)} "
-        f"{_dashboard_label('Exec')}: {_dashboard_value('live' if settings.execute_orders else 'dry-run', ANSI_GREEN)} "
-        f"{_dashboard_label('Symbol')}: {_dashboard_value(settings.symbol, ANSI_MAGENTA)}",
-        flush=True,
-    )
-    print(
-        f"{_dashboard_label('Position')}: {_dashboard_value(position_text, position_color)} "
-        f"{_dashboard_label('Entry')}: {_dashboard_value(entry_price, ANSI_WHITE)} "
+        f"{_dashboard_label('Position')}: {_dashboard_value(position_text, position_color)}  "
+        f"{_dashboard_label('Entry')}: {_dashboard_value(entry_price, ANSI_WHITE)}  "
         f"{_dashboard_label('Size')}: {_dashboard_value(entry_amount, ANSI_WHITE)}",
         flush=True,
     )
     print(
-        f"{_dashboard_label('Signal')}: {_dashboard_value(snapshot.signal, signal_color)} "
-        f"{_dashboard_label('Order')}: {_dashboard_value(snapshot.order_book_bias, order_book_color)} "
+        f"{_dashboard_label('Signal')}: {_dashboard_value(snapshot.signal, signal_color)}    "
+        f"{_dashboard_label('Order')}: {_dashboard_value(snapshot.order_book_bias, order_book_color)}  "
         f"{_dashboard_label('ML')}: {_dashboard_value(ml_bias, ANSI_CYAN)}",
         flush=True,
     )
     print(
-        f"{_dashboard_label('Price')}: {_dashboard_value(f'{snapshot.latest_close:.2f}', ANSI_WHITE)} "
-        f"{_dashboard_label('MA')}: {_dashboard_value(f'{snapshot.long_ma:.2f}', ANSI_WHITE)} "
+        f"{_dashboard_label('Price')}: {_dashboard_value(f'{snapshot.latest_close:.2f}', ANSI_WHITE)}  "
+        f"{_dashboard_label('MA')}: {_dashboard_value(f'{snapshot.long_ma:.2f}', ANSI_WHITE)}  "
         f"{_dashboard_label('Range')}: {_dashboard_value(price_position, ANSI_WHITE)}",
         flush=True,
     )
     print(
-        f"{_dashboard_label('Equity')}: {_dashboard_value(equity, ANSI_GREEN)} "
-        f"{_dashboard_label('SL/TP')}: {_dashboard_value(f'{settings.stop_loss*100:.1f}%/{settings.take_profit*100:.1f}%', ANSI_WHITE)}",
+        f"{_dashboard_label('Equity')}: {_dashboard_value(equity, ANSI_GREEN)}  "
+        f"{_dashboard_label('SL/TP')}: {_dashboard_value(f'{settings.stop_loss*100:.1f}%/{settings.take_profit*100:.1f}%', ANSI_WHITE)}  "
+        f"{_dashboard_label('Mode')}: {_dashboard_value(settings.exchange_id, ANSI_WHITE)}",
         flush=True,
     )
     print(
-        f"{_dashboard_label('MACD')}: {_dashboard_value(macd_text, ANSI_YELLOW)} "
-        f"{_dashboard_label('Confluence')}: {_dashboard_value(confluence_text, ANSI_CYAN)} "
-        f"{_dashboard_label('VolOK')}: {_dashboard_value(vol_text, ANSI_GREEN if snapshot.volume_confirmed else ANSI_RED)}",
+        f"{_dashboard_label('MACD')}: {_dashboard_value(macd_text, ANSI_YELLOW)}  "
+        f"{_dashboard_label('Confluence')}: {_dashboard_value(confluence_text, ANSI_CYAN)}  "
+        f"{_dashboard_label('VolOK')}: {_dashboard_value(vol_text, vol_color)}",
         flush=True,
     )
     print(
-        f"{_dashboard_label('Bids')}: {_dashboard_value(f'{snapshot.bid_volume:.2f}', ANSI_WHITE)} "
-        f"{_dashboard_label('Asks')}: {_dashboard_value(f'{snapshot.ask_volume:.2f}', ANSI_WHITE)} "
-        f"{_dashboard_label('Momentum')}: {_dashboard_value(momentum, ANSI_YELLOW)} "
+        f"{_dashboard_label('Bids')}: {_dashboard_value(f'{snapshot.bid_volume:.2f}', ANSI_WHITE)}  "
+        f"{_dashboard_label('Asks')}: {_dashboard_value(f'{snapshot.ask_volume:.2f}', ANSI_WHITE)}  "
+        f"{_dashboard_label('Momentum')}: {_dashboard_value(momentum, ANSI_YELLOW)}  "
         f"{_dashboard_label('Vol')}: {_dashboard_value(volatility, ANSI_YELLOW)}",
         flush=True,
     )
-    print(_color_text("╠" + "═" * 62 + "╣", ANSI_CYAN), flush=True)
+
+    # ── last decision ────────────────────────────────────────────────────────
+    print(_color_text("╠" + "═" * W + "╣", ANSI_CYAN), flush=True)
+    decision_line = outcome_message[:W - 2]
     print(
-        f"{_color_text('Last decision:', ANSI_BOLD, ANSI_WHITE)} {_color_text(outcome_message, ANSI_WHITE)}",
+        _color_text("║ ", ANSI_CYAN)
+        + _color_text(decision_line.ljust(W - 2), ANSI_WHITE)
+        + _color_text(" ║", ANSI_CYAN),
         flush=True,
     )
-    print(
-        f"{_color_text('Commands:', ANSI_BOLD, ANSI_YELLOW)} {_command_hint()}",
-        flush=True,
-    )
-    print(_color_text("╚" + "═" * 62 + "╝", ANSI_BOLD, ANSI_CYAN), flush=True)
+
+    # ── command output (shown until the next command replaces it) ────────────
+    if last_command_output:
+        print(_color_text("╠" + "═" * W + "╣", ANSI_CYAN), flush=True)
+        for raw_line in last_command_output.splitlines()[:10]:
+            display = raw_line[:W - 2].ljust(W - 2)
+            print(
+                _color_text("║ ", ANSI_CYAN)
+                + _color_text(display, ANSI_YELLOW)
+                + _color_text(" ║", ANSI_CYAN),
+                flush=True,
+            )
+
+    print(_color_text("╚" + "═" * W + "╝", ANSI_BOLD, ANSI_CYAN), flush=True)
+
+    # ── Codex-style prompt ───────────────────────────────────────────────────
+    if sys.stdout.isatty():
+        prompt_bar = "─ TRABOT " + "─" * (W - 8)
+        print(_color_text("╭" + prompt_bar + "╮", ANSI_BOLD, ANSI_CYAN), flush=True)
+        sys.stdout.write(
+            _color_text("│  ❯ ", ANSI_BOLD, ANSI_GREEN)
+            if sys.stdout.isatty()
+            else "│  ❯ "
+        )
+        sys.stdout.flush()
 
 
 def format_auth_error(settings: Settings, exc: Exception) -> str:
@@ -1152,12 +1307,16 @@ def run_bot(settings: Settings) -> int:
             demo=settings.demo,
         )
 
+        _print_splash()
         print(_color_text(describe_mode(settings, exchange=exchange), ANSI_BOLD, ANSI_MAGENTA), flush=True)
         print(_color_text(describe_state_file(settings, state), ANSI_BOLD, ANSI_WHITE), flush=True)
-        print(_color_text("Interactive commands:", ANSI_BOLD, ANSI_YELLOW), _command_hint(), flush=True)
         preflight = fetch_exchange_preflight(exchange)
         if preflight:
             print(_color_text(preflight, ANSI_CYAN), flush=True)
+
+        _start_input_thread()
+
+        last_command_output: str = ""
 
         while True:
             command = read_user_command()
@@ -1175,8 +1334,9 @@ def run_bot(settings: Settings) -> int:
                 command_outcome = handle_user_command(settings, exchange, state, command)
                 if before_command != state:
                     save_state(settings.state_file, state)
-                print(command_outcome.message, flush=True)
+                last_command_output = command_outcome.message
                 if command_outcome.terminate:
+                    print(last_command_output, flush=True)
                     break
 
             before = BotState(
@@ -1197,7 +1357,7 @@ def run_bot(settings: Settings) -> int:
                 if "decision=" in outcome.message:
                     decision = outcome.message.split("decision=")[1].split()[0].strip()
                 record_trade_snapshot(settings, state, outcome.snapshot, decision=decision, outcome=outcome.message)
-                render_dashboard(settings, state, outcome.snapshot, outcome.message)
+                render_dashboard(settings, state, outcome.snapshot, outcome.message, last_command_output)
             else:
                 print(outcome.message, flush=True)
             if outcome.terminate:
@@ -1209,6 +1369,6 @@ def run_bot(settings: Settings) -> int:
         print(format_auth_error(settings, exc), flush=True)
         return 1
     except KeyboardInterrupt:
-        print("Bot stopped by user.", flush=True)
+        print("\nBot stopped by user.", flush=True)
 
     return 0

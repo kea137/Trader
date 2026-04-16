@@ -161,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--volume-confirmation",
         action="store_true",
-        help="Require current volume to be at or above the 20-period average before entering a trade.",
+        help="Apply a -1 penalty to the confluence score when volume is below the 20-period average. Low-volume candles can still trade when other indicators are strong enough to compensate.",
     )
     parser.add_argument(
         "--max-daily-loss",
@@ -222,5 +222,15 @@ def parse_settings() -> Settings:
 
 
 def main() -> int:
+    # When called with no arguments in an interactive terminal, launch the
+    # step-by-step setup wizard instead of argparse.
+    import sys
+    if len(sys.argv) == 1 and sys.stdin.isatty() and sys.stdout.isatty():
+        from trader_app.wizard import run_wizard
+        settings = run_wizard()
+        if settings is None:
+            return 0
+        return run_bot(settings)
+
     settings = parse_settings()
     return run_bot(settings)

@@ -1424,7 +1424,10 @@ def test_compute_latest_macd():
     assert isinstance(h, float)
 
 
-def test_should_enter_blocks_low_volume():
+def test_should_enter_penalises_low_volume_via_confluence():
+    # When volume_confirmation=True and volume is low, the confluence score
+    # receives a -1 penalty.  With threshold=3 and raw score=3, adjusted
+    # score=2 < 3, so entry is blocked with low_confluence — NOT low_volume.
     snapshot = MarketSnapshot(
         signal="BUY",
         bid_volume=10.0,
@@ -1441,10 +1444,35 @@ def test_should_enter_blocks_low_volume():
         confluence_score=3,
         volume_confirmed=False,
     )
-    settings = Settings(volume_confirmation=True)
+    settings = Settings(volume_confirmation=True, confluence_threshold=3)
     enter, reason = should_enter_position(snapshot, False, False, settings)
     assert not enter
-    assert reason == "low_volume"
+    assert "low_confluence" in reason
+    assert reason != "low_volume"
+
+
+def test_should_enter_allows_low_volume_when_other_indicators_strong():
+    # With raw score=4 and -1 penalty, adjusted=3 which meets threshold=3 → enters.
+    snapshot = MarketSnapshot(
+        signal="BUY",
+        bid_volume=10.0,
+        ask_volume=5.0,
+        order_book_bias="BUY",
+        latest_close=100.0,
+        best_bid=99.0,
+        best_ask=101.0,
+        long_ma=95.0,
+        long_ma_slope=1.0,
+        price_position=0.5,
+        momentum=1.0,
+        macd_histogram=0.5,
+        confluence_score=4,
+        volume_confirmed=False,
+    )
+    settings = Settings(volume_confirmation=True, confluence_threshold=3)
+    enter, reason = should_enter_position(snapshot, False, False, settings)
+    assert enter
+    assert reason == "signal_and_order_book"
 
 
 def test_should_enter_blocks_low_confluence():

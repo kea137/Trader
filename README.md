@@ -61,11 +61,17 @@ pip install xgboost
 
 ## Running the bot
 
-### Dry-run mode (recommended for testing)
+### Interactive wizard (recommended)
+
+Running with no arguments launches the step-by-step setup wizard:
 
 ```bash
 python3 trader.py
 ```
+
+The wizard walks through exchange, market, strategy profile, execution mode,
+API credentials, and file paths — then shows a summary before starting.
+All CLI flags below can also be passed directly to skip the wizard.
 
 ### Continuous polling
 
@@ -156,7 +162,7 @@ command profiles, see **[TRADING.md](TRADING.md)**.
 - `--rsi-filter`: block entries at RSI extremes (>70 for BUY, <30 for SELL)
 - `--loss-cooldown`: seconds to pause after a losing trade (default: `0`)
 - `--confluence-threshold`: minimum confirming indicators needed to enter (default: `0`, recommended: `2–3`)
-- `--volume-confirmation`: require current volume ≥ 20-period average
+- `--volume-confirmation`: apply a -1 confluence penalty when volume is below the 20-period average (entry harder, not impossible)
 - `--max-daily-loss`: max fraction of equity lost per day before stopping (default: `0`)
 - `--max-drawdown`: max fraction drawdown from peak equity before stopping (default: `0`)
 
@@ -172,7 +178,7 @@ command profiles, see **[TRADING.md](TRADING.md)**.
 - short entries are blocked if the long MA slope is positive
 - MACD histogram must agree with direction (when order book is neutral)
 - confluence threshold must be met (when configured)
-- volume must be at or above average (when `--volume-confirmation` is set)
+- low volume applies a -1 penalty to the confluence score (when `--volume-confirmation` is set), making entry harder rather than impossible
 - RSI must not be at extremes (when `--rsi-filter` is set)
 - ADX must exceed the minimum (when `--min-adx` is set)
 
@@ -198,8 +204,9 @@ For an open short position, the bot exits when:
 
 While the bot is running, type:
 
-- `help` — show commands
-- `status` — print current state
+- `help` — show available commands
+- `status` — print current position state
+- `history` — display the last 12 trades from the record file
 - `cashout` — exit any open position and terminate
 - `stop` — stop the bot without opening a new trade
 

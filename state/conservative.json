@@ -1,0 +1,11 @@
+{
+  "entry_amount": null,
+  "entry_cost": null,
+  "entry_price": null,
+  "entry_timestamp": null,
+  "has_position": false,
+  "last_candle_time": 1776326400.0,
+  "last_entry_signal": null,
+  "last_total_equity": 187941.63372493,
+  "peak_equity": 188602.43815668
+}
