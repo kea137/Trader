@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TRABOT Backtester — full-cost simulation on historical OHLCV data.
+PROBOT Backtester — full-cost simulation on historical OHLCV data.
 
 Accounts for:
   • Taker fees (market orders)
@@ -574,7 +574,7 @@ def print_report(metrics: dict, cfg: BacktestConfig, trades: list[Trade]) -> Non
     Y = "\033[33m"
 
     print(f"\n{B}{'═' * 70}{R}")
-    print(f"{B}  TRABOT BACKTEST REPORT{R}")
+    print(f"{B}  PROBOT BACKTEST REPORT{R}")
     print(f"{B}{'═' * 70}{R}")
     print(f"  Symbol:      {C}{cfg.symbol}{R}  |  Timeframe: {C}{cfg.timeframe}{R}  |  Days: {C}{cfg.days}{R}")
     print(f"  Windows:     short={cfg.short_window}  long={cfg.long_window}")
@@ -695,7 +695,7 @@ def parameter_sweep(df: pd.DataFrame) -> None:
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="TRABOT backtester")
+    parser = argparse.ArgumentParser(description="PROBOT backtester")
     parser.add_argument("--symbol", default="BTC/USDT")
     parser.add_argument("--timeframe", default="4h")
     parser.add_argument("--days", type=int, default=365)

@@ -42,13 +42,13 @@ def _dashboard_value(text: str, color_code: str | None = None) -> str:
 
 ANSI_CLEAR_SCREEN = "\033[2J\033[H"
 
-_TRABOT_ART = [
-    "████████╗██████╗  █████╗ ██████╗  ██████╗ ████████╗",
-    "╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
-    "   ██║   ██████╔╝███████║██████╔╝██║   ██║   ██║   ",
-    "   ██║   ██╔══██╗██╔══██║██╔══██╗██║   ██║   ██║   ",
-    "   ██║   ██║  ██║██║  ██║██████╔╝╚██████╔╝   ██║   ",
-    "   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝   ╚═╝   ",
+_PROBOT_ART = [
+    "██████╗ ██████╗  ██████╗ ██████╗  ██████╗ ████████╗",
+    "██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
+    "██████╔╝██████╔╝██║   ██║██████╔╝██║   ██║   ██║   ",
+    "██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██║   ██║   ██║   ",
+    "██║     ██║  ██║╚██████╔╝██████╔╝╚██████╔╝   ██║   ",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝  ╚═════╝   ╚═╝   ",
 ]
 
 # Thread-safe queue for commands typed by the user.
@@ -56,13 +56,13 @@ _command_queue: _queue_module.Queue[str] = _queue_module.Queue()
 
 
 def _print_splash() -> None:
-    """Print the TRABOT splash screen on startup (TTY only)."""
+    """Print the PROBOT splash screen on startup (TTY only)."""
     if not sys.stdout.isatty():
         return
     sys.stdout.write(ANSI_CLEAR_SCREEN)
     sys.stdout.flush()
     print()
-    for line in _TRABOT_ART:
+    for line in _PROBOT_ART:
         print(_color_text("  " + line, ANSI_BOLD, ANSI_MAGENTA), flush=True)
     print()
     print(_color_text("  Automated Trading Bot  ·  type  help  to begin", ANSI_BOLD, ANSI_CYAN), flush=True)
@@ -1214,7 +1214,7 @@ def render_dashboard(
 
     # ── header ──────────────────────────────────────────────────────────────
     title = (
-        f" TRABOT  ·  {settings.symbol}  ·  {settings.exchange_id}"
+        f" PROBOT  ·  {settings.symbol}  ·  {settings.exchange_id}"
         f"  ·  {'live' if settings.execute_orders else 'dry-run'}  ·  {timestamp}"
     )
     title_padded = title[:W].ljust(W)
@@ -1292,7 +1292,7 @@ def render_dashboard(
 
     # ── Codex-style prompt ───────────────────────────────────────────────────
     if sys.stdout.isatty():
-        prompt_bar = "─ TRABOT " + "─" * (W - 8)
+        prompt_bar = "─ PROBOT " + "─" * (W - 8)
         print(_color_text("╭" + prompt_bar + "╮", ANSI_BOLD, ANSI_CYAN), flush=True)
         sys.stdout.write(
             _color_text("│  ❯ ", ANSI_BOLD, ANSI_GREEN)
@@ -1322,7 +1322,10 @@ def fetch_exchange_preflight(exchange: Any) -> str | None:
     if not hasattr(exchange, "privateGetV5UserQueryApi"):
         return None
 
-    response = exchange.privateGetV5UserQueryApi({})
+    try:
+        response = exchange.privateGetV5UserQueryApi({})
+    except Exception:
+        return None
     result = response.get("result", {})
     permissions = result.get("permissions", {})
     spot_permissions = permissions.get("Spot", [])

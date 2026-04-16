@@ -1,11 +1,11 @@
 {
-  "entry_amount": 0.001,
+  "entry_amount": null,
   "entry_cost": null,
-  "entry_price": 73916.5,
-  "entry_timestamp": 1776351532.420811,
-  "has_position": true,
-  "last_candle_time": 1776340800.0,
-  "last_entry_signal": "BUY",
-  "last_total_equity": 187527.34102922,
+  "entry_price": null,
+  "entry_timestamp": null,
+  "has_position": false,
+  "last_candle_time": null,
+  "last_entry_signal": null,
+  "last_total_equity": 188736.39239232,
   "peak_equity": 188602.43815668
 }

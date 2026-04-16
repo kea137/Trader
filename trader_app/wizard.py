@@ -1,4 +1,4 @@
-"""Interactive step-by-step setup wizard for TRABOT.
+"""Interactive step-by-step setup wizard for PROBOT.
 
 Launched automatically when ``python3 trader.py`` is called with no
 arguments in an interactive terminal.  Returns a fully-populated
@@ -77,12 +77,12 @@ def _box_bot() -> None:
 # ── Splash ────────────────────────────────────────────────────────────────────
 
 _ART = [
-    "████████╗██████╗  █████╗ ██████╗  ██████╗ ████████╗",
-    "╚══██╔══╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
-    "   ██║   ██████╔╝███████║██████╔╝██║   ██║   ██║   ",
-    "   ██║   ██╔══██╗██╔══██║██╔══██╗██║   ██║   ██║   ",
-    "   ██║   ██║  ██║██║  ██║██████╔╝╚██████╔╝   ██║   ",
-    "   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝   ╚═╝   ",
+    "██████╗ ██████╗  ██████╗ ██████╗  ██████╗ ████████╗",
+    "██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██╔═══██╗╚══██╔══╝",
+    "██████╔╝██████╔╝██║   ██║██████╔╝██║   ██║   ██║   ",
+    "██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██║   ██║   ██║   ",
+    "██║     ██║  ██║╚██████╔╝██████╔╝╚██████╔╝   ██║   ",
+    "╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝  ╚═════╝   ╚═╝   ",
 ]
 
 
@@ -637,7 +637,7 @@ def _step7_summary(cfg: dict) -> bool:
     print()
 
     return _ask(
-        "Launch TRABOT",
+        "Launch PROBOT",
         options=[
             ("y", "Yes — start the bot now"),
             ("n", "No  — abort"),
@@ -703,7 +703,7 @@ def run_wizard() -> Settings | None:
             return None
 
         print()
-        print(_c("  Launching TRABOT…\n", _B, _GRN))
+        print(_c("  Launching PROBOT…\n", _B, _GRN))
         return Settings(**cfg)
 
     except KeyboardInterrupt:
