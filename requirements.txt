@@ -1,4 +1,5 @@
 ccxt
+cryptography
 pandas
 pytest
 xgboost

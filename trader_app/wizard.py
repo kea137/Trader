@@ -573,34 +573,149 @@ def _step5_files() -> tuple[str, str | None]:
     return state_file, record_file
 
 
-def _step6_extras() -> tuple[bool, str | None, str | None]:
-    """Step 6 — XGBoost + API credentials."""
+def _step6_extras(exchange: str, master_pw: str | None) -> tuple[bool, str | None, str | None]:
+    """Step 6 — XGBoost + API credentials.
+
+    *master_pw* is the session master password established at startup.
+    All vault operations use it directly — no per-operation password prompts.
+    """
     _clear()
     _progress(6, "ML Filter & API Keys")
     _box_top("STEP 6 · Extras")
     _box_row("  XGBoost adds an ML bias layer on top of the MA signal.")
-    _box_row("  API keys are needed for demo/live modes.")
+    _box_row("  API keys are managed via the encrypted vault (~/.probot/vault.enc)")
+    _box_row("  or read from TRADER_API_KEY / TRADER_API_SECRET env vars.")
     _box_bot()
     print()
 
     use_xgb = _yn("Enable XGBoost ML filter?", False)
-
     print()
+
+    from trader_app.credentials import (
+        is_available as _vault_available,
+        vault_exists, load_vault, add_credential, clear_vault,
+        DEFAULT_VAULT_PATH,
+    )
+
+    # ── 1. Env vars take priority ─────────────────────────────────────────────
     env_key    = os.getenv("TRADER_API_KEY")
     env_secret = os.getenv("TRADER_API_SECRET")
-
     if env_key and env_secret:
         print(_c("  API key found in environment (TRADER_API_KEY) — will be used.", _GRN))
         print()
         return use_xgb, env_key, env_secret
 
-    print(_c("  No TRADER_API_KEY / TRADER_API_SECRET found in environment.", _YLW))
-    print(_c("  Enter below (input is hidden) or leave blank for dry-run.", _DIM, _WHT))
+    # ── 2. No crypto or no master password → manual entry ────────────────────
+    if not _vault_available() or master_pw is None:
+        if not _vault_available():
+            print(_c("  ⚠  'cryptography' package not installed — vault unavailable.", _YLW))
+            print(_c("     Run: pip install cryptography", _DIM, _WHT))
+        else:
+            print(_c("  Vault access unavailable (master password not set).", _YLW))
+        print()
+        key_in = _ask("API key (Enter to skip)", default="")
+        sec_in = _ask("API secret (Enter to skip, hidden)", default="", secret=True)
+        return use_xgb, key_in or None, sec_in or None
+
+    # ── 3. Vault flow (master_pw already verified at startup) ─────────────────
+    print(_c("  Credential Vault  (~/.probot/vault.enc)", _B, _CYN))
     print()
 
+    vault_action = _ask(
+        "API credentials source",
+        options=[
+            ("load",  "Load from vault      (use a saved key)"),
+            ("save",  "Save new keys        (add to vault)"),
+            ("clear", "Clear vault          (delete all stored credentials)"),
+            ("skip",  "Enter without saving (dry-run friendly)"),
+        ],
+        default="load" if vault_exists(DEFAULT_VAULT_PATH) else "save",
+    )
+
+    # ── Clear vault ───────────────────────────────────────────────────────────
+    if vault_action == "clear":
+        print()
+        _box_top("CLEAR VAULT")
+        _box_row("  This will permanently delete ALL stored API credentials.", _RED)
+        _box_bot()
+        print()
+        try:
+            clear_vault(master_pw, DEFAULT_VAULT_PATH)
+            print(_c("  ✔  Vault cleared — all credentials have been deleted.", _GRN))
+        except Exception as exc:
+            print(_c(f"  ✗  Could not clear vault: {exc}", _RED))
+        print()
+        key_in = _ask("API key (Enter to skip)", default="")
+        sec_in = _ask("API secret (Enter to skip, hidden)", default="", secret=True)
+        return use_xgb, key_in or None, sec_in or None
+
+    # ── Load from vault ───────────────────────────────────────────────────────
+    if vault_action == "load":
+        try:
+            creds = load_vault(master_pw, DEFAULT_VAULT_PATH)
+        except Exception as exc:
+            print(_c(f"  ✗  Could not open vault: {exc}", _RED))
+            print()
+            key_in = _ask("API key (Enter to skip)", default="")
+            sec_in = _ask("API secret (Enter to skip, hidden)", default="", secret=True)
+            return use_xgb, key_in or None, sec_in or None
+
+        matching = [c for c in creds if c["exchange"] == exchange]
+        all_entries = creds
+        display = (
+            [(c["label"], f"{c['label']}  ({c['exchange']})") for c in matching]
+            if matching else
+            [(c["label"], f"{c['label']}  ({c['exchange']})") for c in all_entries]
+        )
+
+        if not creds:
+            print(_c("  Vault is empty — switch to 'Save new keys' to add credentials.", _YLW))
+            print()
+            key_in = _ask("API key (Enter to skip)", default="")
+            sec_in = _ask("API secret (Enter to skip, hidden)", default="", secret=True)
+            return use_xgb, key_in or None, sec_in or None
+
+        if not matching:
+            print(_c(f"  No credentials stored for {exchange}. Showing all.", _YLW))
+        print()
+
+        chosen_label = _ask(
+            "Select credential",
+            options=display,
+            default=display[0][0],
+        )
+        chosen = next((c for c in creds if c["label"] == chosen_label), None)
+        if chosen:
+            print(_c(f"  ✔  Loaded credentials for '{chosen_label}'", _GRN))
+            print()
+            return use_xgb, chosen["key"] or None, chosen["secret"] or None
+
+    # ── Save new keys to vault ────────────────────────────────────────────────
+    if vault_action == "save":
+        print()
+        print(_c("  Enter new API credentials to save to the vault.", _WHT))
+        print()
+        label   = _ask("Label for this credential (e.g. bybit-demo)", default=exchange)
+        key_in  = _ask("API key", default="")
+        sec_in  = _ask("API secret (hidden)", default="", secret=True)
+        pass_in = _ask("API password / passphrase (Enter to skip)", default="")
+        if key_in and sec_in:
+            try:
+                add_credential(
+                    label=label, exchange=exchange,
+                    key=key_in, secret=sec_in, password=pass_in,
+                    master_password=master_pw, vault_path=DEFAULT_VAULT_PATH,
+                )
+                print(_c(f"  ✔  Saved '{label}' to vault.", _GRN))
+            except Exception as exc:
+                print(_c(f"  ✗  Could not save to vault: {exc}", _RED))
+        print()
+        return use_xgb, key_in or None, sec_in or None
+
+    # ── Skip / manual entry ───────────────────────────────────────────────────
+    print()
     key_in = _ask("API key (Enter to skip)", default="")
     sec_in = _ask("API secret (Enter to skip, hidden)", default="", secret=True)
-
     return use_xgb, key_in or None, sec_in or None
 
 
@@ -668,6 +783,76 @@ def _describe_profile(cfg: dict) -> str:
     return "aggressive"
 
 
+# ── Master password gate ─────────────────────────────────────────────────────
+
+def _unlock_master_password() -> str | None:
+    """Prompt for the session master password at wizard startup.
+
+    * If the vault already exists  → verify the password against it.
+    * If no vault exists yet       → ask for a new password + confirmation.
+    * If the cryptography package is missing → skip silently (returns None).
+    """
+    import getpass as _gp
+    from trader_app.credentials import (
+        is_available as _vault_available,
+        vault_exists, load_vault, save_vault, DEFAULT_VAULT_PATH,
+    )
+
+    if not _vault_available():
+        return None
+
+    _clear()
+    _box_top("MASTER PASSWORD")
+    if vault_exists(DEFAULT_VAULT_PATH):
+        _box_row("  Enter your master password to unlock the credential vault.", _WHT)
+        _box_row("  This password will be used for all vault operations this session.", _DIM)
+    else:
+        _box_row("  No vault found. Set a master password to create one.", _YLW)
+        _box_row("  This password protects all your stored API credentials.", _DIM)
+        _box_row("  Choose something strong — it cannot be recovered if lost.", _DIM)
+    _box_bot()
+    print()
+
+    if vault_exists(DEFAULT_VAULT_PATH):
+        for attempt in range(3):
+            sys.stdout.write(_c("  Master password: ", _WHT))
+            sys.stdout.flush()
+            pw = _gp.getpass("")
+            try:
+                load_vault(pw, DEFAULT_VAULT_PATH)  # verify
+                print(_c("  ✔  Vault unlocked.", _GRN))
+                print()
+                return pw
+            except ValueError:
+                remaining = 2 - attempt
+                if remaining:
+                    print(_c(f"  ✗  Wrong password. {remaining} attempt(s) remaining.", _RED))
+                else:
+                    print(_c("  ✗  Too many failed attempts — vault access skipped.", _RED))
+        print()
+        return None
+    else:
+        # New vault — set password with confirmation
+        while True:
+            sys.stdout.write(_c("  New master password: ", _WHT))
+            sys.stdout.flush()
+            pw = _gp.getpass("")
+            if not pw:
+                print(_c("  Password cannot be empty.", _RED))
+                continue
+            sys.stdout.write(_c("  Confirm master password: ", _WHT))
+            sys.stdout.flush()
+            pw2 = _gp.getpass("")
+            if pw != pw2:
+                print(_c("  ✗  Passwords do not match — try again.", _RED))
+                continue
+            # Initialise vault with empty list so future runs know it exists
+            save_vault([], pw, DEFAULT_VAULT_PATH)
+            print(_c("  ✔  Master password set. Vault created.", _GRN))
+            print()
+            return pw
+
+
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def run_wizard() -> Settings | None:
@@ -683,12 +868,14 @@ def run_wizard() -> Settings | None:
         input(_c("  Press Enter to begin  ·  Ctrl+C to abort", _B, _YLW))
         print()
 
+        master_pw = _unlock_master_password()
+
         exchange, demo, sandbox   = _step1_exchange()
         symbol, tf, sw, lw        = _step2_market()
         profile                   = _step3_profile()
         execute, amount, poll     = _step4_execution(demo)
         state_file, record_file   = _step5_files()
-        use_xgb, api_key, api_sec = _step6_extras()
+        use_xgb, api_key, api_sec = _step6_extras(exchange, master_pw)
 
         cfg: dict = dict(
             exchange_id=exchange,
@@ -717,10 +904,6 @@ def run_wizard() -> Settings | None:
         print()
         print(_c("  Launching PROBOT…\n", _B, _GRN))
         return Settings(**cfg)
-
-    except KeyboardInterrupt:
-        print(_c("\n\n  Wizard aborted.\n", _YLW))
-        return None
 
     except KeyboardInterrupt:
         print(_c("\n\n  Wizard aborted.\n", _YLW))

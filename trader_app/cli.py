@@ -179,17 +179,57 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_api_credentials(exchange_id: str) -> tuple[str | None, str | None, str | None]:
+    """Return (api_key, api_secret, api_password) from env vars or the vault.
+
+    Env vars always take priority.  If they are absent and the vault exists,
+    the user is prompted for the master password and the first matching
+    credential for *exchange_id* is returned.
+    """
+    key    = os.getenv("TRADER_API_KEY")
+    secret = os.getenv("TRADER_API_SECRET")
+    pwd    = os.getenv("TRADER_API_PASSWORD")
+    if key and secret:
+        return key, secret, pwd
+
+    try:
+        from trader_app.credentials import (
+            is_available, vault_exists, load_vault, DEFAULT_VAULT_PATH,
+        )
+    except ImportError:
+        return None, None, None
+
+    if not is_available() or not vault_exists(DEFAULT_VAULT_PATH):
+        return None, None, None
+
+    import getpass
+    try:
+        master_pw = getpass.getpass("Vault master password: ")
+        creds = load_vault(master_pw, DEFAULT_VAULT_PATH)
+    except (ValueError, Exception):
+        return None, None, None
+
+    # Prefer an entry whose exchange matches; fall back to first entry
+    match = next((c for c in creds if c["exchange"] == exchange_id), None)
+    if match is None and creds:
+        match = creds[0]
+    if match:
+        return match["key"] or None, match["secret"] or None, match["password"] or None
+    return None, None, None
+
+
 def parse_settings() -> Settings:
     args = build_parser().parse_args()
+    api_key, api_secret, api_password = _resolve_api_credentials(args.exchange)
     return Settings(
         exchange_id=args.exchange,
         symbol=args.symbol,
         timeframe=args.timeframe,
         short_window=args.short_window,
         long_window=args.long_window,
-        api_key=os.getenv("TRADER_API_KEY"),
-        api_secret=os.getenv("TRADER_API_SECRET"),
-        api_password=os.getenv("TRADER_API_PASSWORD"),
+        api_key=api_key,
+        api_secret=api_secret,
+        api_password=api_password,
         order_amount=args.order_amount,
         execute_orders=args.execute,
         sandbox=args.sandbox,
