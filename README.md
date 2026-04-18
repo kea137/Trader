@@ -1,4 +1,4 @@
-# Trader
+# PROBOT CRYPTO
 
 A small Python trading bot that generates a moving-average signal from exchange OHLCV data and manages trades using order-book bias, stop-loss, take-profit, and optional shorting.
 
