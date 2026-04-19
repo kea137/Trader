@@ -11,9 +11,15 @@ import getpass
 import os
 import select
 import sys
-import tty
-import termios
 from typing import Any, Callable
+
+# Platform-specific raw-mode imports
+_IS_WINDOWS = sys.platform == "win32"
+if _IS_WINDOWS:
+    import msvcrt
+else:
+    import tty
+    import termios
 
 from trader_app.config import Settings
 
@@ -116,48 +122,59 @@ def _progress(step: int, label: str) -> None:
 def _read_key() -> str:
     """Read a single keypress from stdin in raw mode.
 
-    Uses os.read() directly (bypasses Python's buffered IO) and a
-    select() timeout to distinguish a bare Escape from an arrow sequence.
+    Cross-platform: uses msvcrt on Windows, tty/termios on Unix.
     Returns one of: "up", "down", "left", "right", "enter", "ctrl_c",
     or a character.
     """
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        ch = os.read(fd, 1).decode("utf-8", errors="replace")
-        if ch == "\x03":                         # Ctrl+C
+    if _IS_WINDOWS:
+        ch = msvcrt.getwch()
+        if ch == "\x03":           # Ctrl+C
             return "ctrl_c"
-        if ch == "\r" or ch == "\n":             # Enter
+        if ch in ("\r", "\n"):     # Enter
             return "enter"
-        if ch == "\x1b":                         # possible escape sequence
-            # Use select with a short timeout so a bare Escape doesn't block
-            ready, _, _ = select.select([fd], [], [], 0.05)
-            if ready:
-                nxt = os.read(fd, 1).decode("utf-8", errors="replace")
-                if nxt in ("[", "O"):
-                    ready2, _, _ = select.select([fd], [], [], 0.05)
-                    if ready2:
-                        code = os.read(fd, 1).decode("utf-8", errors="replace")
-                        if code == "A":
-                            return "up"
-                        if code == "B":
-                            return "down"
-                        if code == "C":
-                            return "right"
-                        if code == "D":
-                            return "left"
-                        # Drain extended sequences like Page-Up (~)
-                        if code.isdigit():
-                            select.select([fd], [], [], 0.05)
-                            try:
-                                os.read(fd, 1)
-                            except OSError:
-                                pass
+        if ch in ("\x00", "\xe0"): # special / arrow prefix
+            code = msvcrt.getwch()
+            _map = {"H": "up", "P": "down", "K": "left", "M": "right"}
+            return _map.get(code, "escape")
+        if ch == "\x1b":
             return "escape"
         return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    else:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = os.read(fd, 1).decode("utf-8", errors="replace")
+            if ch == "\x03":                         # Ctrl+C
+                return "ctrl_c"
+            if ch == "\r" or ch == "\n":             # Enter
+                return "enter"
+            if ch == "\x1b":                         # possible escape sequence
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if ready:
+                    nxt = os.read(fd, 1).decode("utf-8", errors="replace")
+                    if nxt in ("[", "O"):
+                        ready2, _, _ = select.select([fd], [], [], 0.05)
+                        if ready2:
+                            code = os.read(fd, 1).decode("utf-8", errors="replace")
+                            if code == "A":
+                                return "up"
+                            if code == "B":
+                                return "down"
+                            if code == "C":
+                                return "right"
+                            if code == "D":
+                                return "left"
+                            if code.isdigit():
+                                select.select([fd], [], [], 0.05)
+                                try:
+                                    os.read(fd, 1)
+                                except OSError:
+                                    pass
+                return "escape"
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 # ── Arrow-key menu ────────────────────────────────────────────────────────────
